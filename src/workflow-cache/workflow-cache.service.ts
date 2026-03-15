@@ -72,4 +72,52 @@ export class WorkflowCacheService {
     const v = map?.get(`_fanout_${nodeExecutionId}_total`);
     return typeof v === 'number' ? v : undefined;
   }
+
+  /** Store one fanout iteration's returnvalue so we can build loop[] when all complete. */
+  async addFanoutIterationResult(
+    workflowExecutionId: string,
+    nodeExecutionId: string,
+    fanoutIndex: number,
+    returnvalue: Record<string, unknown>,
+  ): Promise<void> {
+    let map = this.cache.get(workflowExecutionId);
+    if (!map) {
+      map = new Map();
+      this.cache.set(workflowExecutionId, map);
+    }
+    const key = `_fanout_${nodeExecutionId}_results`;
+    const arr = (map.get(key) as unknown[]) ?? [];
+    while (arr.length <= fanoutIndex) arr.push(null);
+    arr[fanoutIndex] = returnvalue;
+    map.set(key, arr);
+  }
+
+  /** Get per-iteration results for a fanout child (used when building loop). */
+  getFanoutResults(workflowExecutionId: string, nodeExecutionId: string): unknown[] {
+    const map = this.cache.get(workflowExecutionId);
+    const arr = map?.get(`_fanout_${nodeExecutionId}_results`);
+    return Array.isArray(arr) ? arr : [];
+  }
+
+  /** Store batch structure when fanout starts (one result per batch). */
+  async setFanoutBatches(
+    workflowExecutionId: string,
+    nodeExecutionId: string,
+    batches: unknown[][],
+  ): Promise<void> {
+    await this.addOutputAsCache(
+      workflowExecutionId,
+      `_fanout_${nodeExecutionId}_batches`,
+      batches,
+    );
+  }
+
+  getFanoutBatches(
+    workflowExecutionId: string,
+    nodeExecutionId: string,
+  ): unknown[][] | undefined {
+    const map = this.cache.get(workflowExecutionId);
+    const v = map?.get(`_fanout_${nodeExecutionId}_batches`);
+    return Array.isArray(v) ? (v as unknown[][]) : undefined;
+  }
 }

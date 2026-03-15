@@ -1,7 +1,8 @@
-import { Controller, Get, Query, Res, Req } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { createHash, randomBytes } from 'crypto';
 import { IntegrationHubService } from './integration-hub.service';
+import { WorkflowService } from '../workflow/workflow.service';
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -13,7 +14,12 @@ const AIRTABLE_SCOPES = 'data.records:read data.records:write schema.bases:read 
 
 /** PKCE code_verifier (and redirect_uri used) per state; cleaned after use or TTL. */
 const airtablePkceStore = new Map<string, { code_verifier: string; redirect_uri: string }>();
+const calendlyPkceStore = new Map<string, string>(); // state -> code_verifier
 const PKCE_TTL_MS = 10 * 60 * 1000;
+
+const CALENDLY_AUTH_URL = 'https://auth.calendly.com/oauth';
+
+const ZOHO_SCOPE = 'ZohoCRM.users.READ,ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.settings.workflow_rules.ALL,ZohoCRM.settings.automation_actions.CREATE';
 
 function base64UrlEncode(buf: Buffer): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -41,18 +47,133 @@ const SERVICE_TO_GOOGLE_SCOPE: Record<string, string> = {
   googledrive: 'https://www.googleapis.com/auth/drive',
 };
 
+/** OAuth token response (error or access_token). */
+interface OAuthTokenResponse {
+  error?: string;
+  error_description?: string;
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  organization?: string;
+}
+
+interface GoogleUserInfo {
+  email?: string;
+  id?: string;
+}
+
+interface HubSpotTokenInfo {
+  user?: string;
+}
+
+interface CalendlyUserResource {
+  uri?: string;
+  name?: string;
+  email?: string;
+}
+
+interface CalendlyUserData {
+  resource?: CalendlyUserResource;
+}
+
+interface ZohoUser {
+  full_name?: string;
+  email?: string;
+}
+
+interface ZohoUsersData {
+  users?: ZohoUser[];
+}
+
 /**
  * Served at /orchestration (excluded from /api prefix) so the popup can load
  * http://localhost:8000/orchestration/gsheets/connect and get a real redirect to Google.
  */
 @Controller('orchestration')
 export class OrchestrationController {
-  constructor(private readonly integrationHub: IntegrationHubService) {}
+  constructor(
+    private readonly integrationHub: IntegrationHubService,
+    private readonly workflowService: WorkflowService,
+  ) {}
+
+  /**
+   * Instantly (and other) webhook trigger: POST /orchestration/workflow/instantly/trigger-webhook?workflowId=...&nodeId=...&userId=...
+   * Body is passed as the trigger payload (variableName "trigger" for Campaign Reply Auto-Responder template).
+   */
+  @Post('workflow/:node/trigger-webhook')
+  async handleWorkflowTriggerWebhook(
+    @Param('node') node: string,
+    @Query('workflowId') workflowId: string,
+    @Query('nodeId') nodeId: string,
+    @Query('userId') userId: string,
+    @Body() payload: any,
+  ) {
+    if (!workflowId) {
+      throw new BadRequestException('workflowId is required in query parameters');
+    }
+    if (!userId) {
+      throw new BadRequestException('userId is required in query parameters');
+    }
+    const nodeLower = (node || '').toLowerCase();
+    if (nodeLower !== 'instantly' && nodeLower !== 'calendly' && nodeLower !== 'cal') {
+      throw new BadRequestException(`Unsupported webhook node: ${node}`);
+    }
+    const triggerVariableName = 'trigger';
+    const input = [{ variableName: triggerVariableName, variableValue: payload ?? {} }];
+    const executionPayload = await this.workflowService.createWorkflowExecutionPayload(workflowId, userId);
+    const finalPayload = { ...executionPayload, input };
+    const messageId = await this.workflowService.enqueueWorkflowExecutionPayload(finalPayload);
+    return { workflowExecutionId: executionPayload.workflowExecutionId, messageId, accepted: true };
+  }
 
   /** Default Airtable redirect path: use /auth/callback so Airtable app redirect URI matches (avoids 404). */
   private getAirtableRedirectUri(): string {
     const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
     return (process.env.AIRTABLE_REDIRECT_URI || '').trim() || `${baseUrl}/orchestration/airtable/auth/callback`;
+  }
+
+  /**
+   * Calendly redirect URI must exactly match the value registered in your Calendly app (developer.calendly.com).
+   * No trailing slash; use CALENDLY_REDIRECT_URI in .env to avoid mismatch (e.g. when behind proxy or different port).
+   */
+  private getCalendlyRedirectUri(): string {
+    const explicit = (process.env.CALENDLY_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    if (explicit && (explicit.startsWith('http://') || explicit.startsWith('https://'))) {
+      return explicit;
+    }
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+    return `${baseUrl}/orchestration/calendly/callback`;
+  }
+
+  /** Zoho OAuth redirect URI; must match the value registered in Zoho API Console. */
+  private getZohoRedirectUri(): string {
+    const explicit = (process.env.ZOHO_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    if (explicit && (explicit.startsWith('http://') || explicit.startsWith('https://'))) {
+      return explicit;
+    }
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+    return `${baseUrl}/orchestration/zoho/callback`;
+  }
+
+  /** Zoho region-specific auth and CRM base URLs (in, com, eu). */
+  private getZohoRegionUrls(region?: string): { authUrl: string; baseUrl: string } {
+    const r = (region || '').toLowerCase();
+    if (r === 'com' || r === 'us') {
+      return {
+        authUrl: (process.env.ZOHO_AUTH_URL_US || process.env.ZOHO_AUTH_URL_COM || 'https://accounts.zoho.com/oauth/v2').replace(/\/+$/, ''),
+        baseUrl: (process.env.ZOHO_CRM_BASE_US || process.env.ZOHO_CRM_BASE_COM || 'https://www.zohoapis.com').replace(/\/+$/, ''),
+      };
+    }
+    if (r === 'eu') {
+      return {
+        authUrl: (process.env.ZOHO_AUTH_URL_EU || 'https://accounts.zoho.eu/oauth/v2').replace(/\/+$/, ''),
+        baseUrl: (process.env.ZOHO_CRM_BASE_EU || 'https://www.zohoapis.eu').replace(/\/+$/, ''),
+      };
+    }
+    return {
+      authUrl: (process.env.ZOHO_AUTH_URL || 'https://accounts.zoho.in/oauth/v2').replace(/\/+$/, ''),
+      baseUrl: (process.env.ZOHO_CRM_BASE || 'https://www.zohoapis.in').replace(/\/+$/, ''),
+    };
   }
 
   /** Airtable OAuth: return auth URL with PKCE for frontend to open in popup (GET /orchestration/airtable/auth/login). */
@@ -146,8 +267,8 @@ export class OrchestrationController {
         },
         body: new URLSearchParams(tokenBody),
       });
-      const tokens = await tokenRes.json();
-      if (tokens.error) {
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
+      if (tokens.error || !tokens.access_token) {
         res.send(this.closePopupHtml(`Airtable token error: ${tokens.error_description || tokens.error}`));
         return;
       }
@@ -165,8 +286,31 @@ export class OrchestrationController {
   }
 
   @Get(':service/connect')
-  connect(@Query('userId') userId: string, @Query('state') state: string, @Res() res: Response, @Req() req: any) {
+  connect(@Query('userId') userId: string, @Query('state') state: string, @Query('region') region: string, @Res() res: Response, @Req() req: any) {
     const service = (req.params?.service || '').toLowerCase();
+    if (service === 'zoho') {
+      const uid = (userId || state?.split('|')[0] || '').trim() || '000000000000000000000001';
+      const clientId = (process.env.ZOHO_CLIENT_ID || '').trim();
+      const clientSecret = (process.env.ZOHO_CLIENT_SECRET || '').trim();
+      const redirectUri = this.getZohoRedirectUri();
+      if (!clientId || !clientSecret) {
+        res.status(500).send('<p>Zoho OAuth not configured. Set ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET in backend .env.</p>');
+        return;
+      }
+      const { authUrl: zohoAuthBase } = this.getZohoRegionUrls(region);
+      const stateParam = Buffer.from(JSON.stringify({ userId: uid })).toString('base64');
+      const params = new URLSearchParams({
+        scope: ZOHO_SCOPE,
+        client_id: clientId,
+        response_type: 'code',
+        access_type: 'offline',
+        redirect_uri: redirectUri,
+        state: stateParam,
+      });
+      const authUrl = `${zohoAuthBase}/auth?${params.toString()}`;
+      res.redirect(302, authUrl);
+      return;
+    }
     if (service === 'airtable') {
       const uid = userId || state?.split('|')[0] || '000000000000000000000001';
       const clientId = (process.env.AIRTABLE_CLIENT_ID || '').trim();
@@ -230,8 +374,8 @@ export class OrchestrationController {
           grant_type: 'authorization_code',
         }),
       });
-      const tokens = await tokenRes.json();
-      if (tokens.error) {
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
+      if (tokens.error || !tokens.access_token) {
         res.send(this.closePopupHtml(`Token error: ${tokens.error_description || tokens.error}`));
         return;
       }
@@ -242,7 +386,7 @@ export class OrchestrationController {
         const userRes = await fetch(GOOGLE_USERINFO_URL, {
           headers: { Authorization: `Bearer ${accessToken}` },
         });
-        const user = await userRes.json();
+        const user = (await userRes.json()) as GoogleUserInfo;
         email = user?.email || user?.id || '';
       } catch {
         // continue without email
@@ -283,8 +427,10 @@ export class OrchestrationController {
       const redirectUri = this.getHubSpotRedirectUri();
       const appUrl = (process.env.HUBSPOT_APP_URL || 'https://app.hubspot.com').replace(/\/+$/, '');
       const state = `${uid}|hubspot`;
-      // Full scope set required by HubSpot app (contacts, companies, deals, leads, orders, quotes, etc.)
+      // Scopes must include everything required by the HubSpot app (Developer Portal). If you get "missing scopes"
+      // errors, add the scope names from the error message here. CRM scopes + app-required scopes below.
       const scopes = [
+        // CRM (contacts, companies, deals, etc.)
         'crm.objects.contacts.read', 'crm.objects.contacts.write', 'crm.schemas.contacts.read', 'crm.schemas.contacts.write',
         'crm.objects.companies.read', 'crm.objects.companies.write', 'crm.schemas.companies.read', 'crm.schemas.companies.write',
         'crm.objects.deals.read', 'crm.objects.deals.write', 'crm.schemas.deals.read', 'crm.schemas.deals.write',
@@ -315,6 +461,29 @@ export class OrchestrationController {
         'crm.extensions_calling_transcripts.read', 'crm.extensions_calling_transcripts.write',
         'crm.export', 'crm.import',
         'tickets', 'automation', 'sales-email-read',
+        // App-required scopes (add any scope HubSpot says is "required for the app to function")
+        'content', 'tax_rates.read', 'social', 'actions', 'timeline',
+        'collector.graphql_schema.read', 'business-intelligence', 'collector.graphql_query.execute',
+        'forms', 'files', 'hubdb', 'transactional-email',
+        'account-info.security.read', 'record_images.signed_urls.read',
+        'integration-sync', 'cms.performance.read', 'e-commerce',
+        'integrations.zoom-app.playbooks.read', 'settings.currencies.read', 'settings.currencies.write',
+        'accounting', 'external_integrations.forms.access', 'business_units_view.read', 'forms-uploaded-files',
+        'communication_preferences.read_write', 'data_integration.data_source.file.read', 'data_integration.data_source.file.write',
+        // Do NOT add analytics.behavioral_event.s.send or analytics.behavioral_events.send - HubSpot reports them as invalid.
+        'ctas.read', 'behavioral_events.event_definitions.read_write', 'marketing-email',
+        'communication_preferences.read', 'communication_preferences.write', 'settings.users.write',
+        'conversations.visitor_identification.tokens.create', 'settings.security.security_health.read', 'files.ui_hidden.read',
+        'settings.users.read', 'cms.domains.read', 'cms.domains.write', 'cms.functions.read', 'cms.functions.write',
+        'media_bridge.read', 'media_bridge.write', 'settings.billing.write',
+        'conversations.custom_channels.read', 'conversations.custom_channels.write',
+        'marketing.campaigns.read', 'marketing.campaigns.write', 'marketing.campaigns.revenue.read',
+        'automation.sequences.enrollments.write', 'automation.sequences.read',
+        'communication_preferences.statuses.batch.read', 'communication_preferences.statuses.batch.write',
+        'cms.knowledge_base.articles.publish', 'cms.knowledge_base.articles.write', 'cms.knowledge_base.articles.read',
+        'cms.knowledge_base.settings.read', 'cms.knowledge_base.settings.write', 'cms.membership.access_groups.read',
+        'settings.users.teams.write', 'cms.membership.access_groups.write', 'settings.users.teams.read',
+        'conversations.read', 'conversations.write', 'scheduler.meetings.meeting-link.read',
       ].join(' ');
       const authUrl = `${appUrl}/oauth/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&state=${encodeURIComponent(state)}`;
       res.json({ authUrl, url: authUrl });
@@ -365,7 +534,7 @@ export class OrchestrationController {
           code,
         }),
       });
-      const tokens = await tokenRes.json();
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
       if (tokens.error || !tokens.access_token) {
         res.send(this.closePopupHtml(`HubSpot token error: ${tokens.error_description || tokens.error || 'Unknown'}`));
         return;
@@ -377,7 +546,7 @@ export class OrchestrationController {
       let email: string | undefined;
       try {
         const infoRes = await fetch(`${baseUrl}/oauth/v1/access-tokens/${accessToken}`);
-        const info = await infoRes.json();
+        const info = (await infoRes.json()) as HubSpotTokenInfo;
         email = info.user;
       } catch {
         // continue without email
@@ -391,6 +560,220 @@ export class OrchestrationController {
       res.send(this.closePopupHtml(null, accountId));
     } catch (e: any) {
       res.send(this.closePopupHtml(e?.message || 'Failed to complete HubSpot sign-in.'));
+    }
+  }
+
+  /** Calendly OAuth: return auth URL for frontend to open in popup (GET /orchestration/calendly/login). */
+  @Get('calendly/login')
+  calendlyLogin(@Query('userId') userId: string, @Res() res: Response) {
+    const uid = (userId || '').trim() || '000000000000000000000001';
+    const clientId = (process.env.CALENDLY_CLIENT_ID || '').trim();
+    const redirectUri = this.getCalendlyRedirectUri();
+    if (!clientId || !redirectUri) {
+      res.status(200).json({
+        authUrl: '',
+        url: '',
+        error: 'CALENDLY_CLIENT_ID and redirect URI not set. Set CALENDLY_CLIENT_ID in backend .env and ensure BASE_URL or CALENDLY_REDIRECT_URI is set. See OAUTH_SETUP_GUIDE.md.',
+      });
+      return;
+    }
+    const codeVerifier = randomBytes(32).toString('hex');
+    const codeChallenge = createHash('sha256').update(codeVerifier, 'utf8').digest('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const state = Buffer.from(JSON.stringify({ userId: uid, codeVerifier, timestamp: Date.now(), nonce: randomBytes(16).toString('hex') })).toString('base64');
+    calendlyPkceStore.set(state, codeVerifier);
+    setTimeout(() => calendlyPkceStore.delete(state), PKCE_TTL_MS);
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+    });
+    const authUrl = `${CALENDLY_AUTH_URL}/authorize?${params.toString()}`;
+    res.json({ authUrl, url: authUrl, redirectUri });
+  }
+
+  /** Calendly OAuth callback: exchange code for token and save. */
+  @Get('calendly/callback')
+  async calendlyCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('error') error: string,
+    @Res() res: Response,
+  ) {
+    if (error) {
+      res.send(this.closePopupHtml(`Calendly OAuth error: ${error}`));
+      return;
+    }
+    if (!code || !state) {
+      res.send(this.closePopupHtml('Missing code or state. Try connecting again.'));
+      return;
+    }
+    let userId: string;
+    let codeVerifier: string;
+    try {
+      const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+      userId = decoded?.userId || '000000000000000000000001';
+      codeVerifier = calendlyPkceStore.get(state) || decoded?.codeVerifier;
+    } catch {
+      res.send(this.closePopupHtml('Invalid state. Try connecting again.'));
+      return;
+    }
+    calendlyPkceStore.delete(state);
+    const clientId = (process.env.CALENDLY_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.CALENDLY_CLIENT_SECRET || '').trim();
+    const redirectUri = this.getCalendlyRedirectUri();
+    if (!clientId || !clientSecret) {
+      res.send(this.closePopupHtml('Calendly OAuth not configured. Set CALENDLY_CLIENT_ID and CALENDLY_CLIENT_SECRET in .env'));
+      return;
+    }
+    try {
+      const tokenRes = await fetch(`${CALENDLY_AUTH_URL}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          client_secret: clientSecret,
+          ...(codeVerifier ? { code_verifier: codeVerifier } : {}),
+        }),
+      });
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
+      if (tokens.error || !tokens.access_token) {
+        res.send(this.closePopupHtml(`Calendly token error: ${tokens.error_description || tokens.error || 'Unknown'}`));
+        return;
+      }
+      const accessToken = tokens.access_token as string;
+      const refreshToken = (tokens.refresh_token as string) || '';
+      const organization = tokens.organization as string | undefined;
+      const userRes = await fetch('https://api.calendly.com/users/me', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const userData = (await userRes.json()) as CalendlyUserData;
+      const resource = userData?.resource || {};
+      const userUri = resource.uri;
+      const userName = resource.name;
+      const userEmail = resource.email;
+      const accountId = await this.integrationHub.saveCalendlyOAuthAccount(userId, {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        email: userEmail,
+        user_name: userName,
+        meta: { user_uri: userUri, organization_uri: organization },
+      });
+      res.send(this.closePopupHtml(null, accountId));
+    } catch (e: any) {
+      res.send(this.closePopupHtml(e?.message || 'Failed to complete Calendly sign-in.'));
+    }
+  }
+
+  /** Zoho OAuth: return auth URL for frontend (GET /orchestration/zoho/login). Frontend uses response.data as URL. */
+  @Get('zoho/login')
+  zohoLogin(@Query('userId') userId: string, @Query('region') region: string, @Res() res: Response) {
+    const uid = (userId || '').trim() || '000000000000000000000001';
+    const clientId = (process.env.ZOHO_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.ZOHO_CLIENT_SECRET || '').trim();
+    const redirectUri = this.getZohoRedirectUri();
+    if (!clientId || !clientSecret) {
+      res.status(500).send('Zoho OAuth not configured. Set ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET in backend .env.');
+      return;
+    }
+    const { authUrl: zohoAuthBase } = this.getZohoRegionUrls(region);
+    const state = Buffer.from(JSON.stringify({ userId: uid })).toString('base64');
+    const params = new URLSearchParams({
+      scope: ZOHO_SCOPE,
+      client_id: clientId,
+      response_type: 'code',
+      access_type: 'offline',
+      redirect_uri: redirectUri,
+      state,
+    });
+    const authUrl = `${zohoAuthBase}/auth?${params.toString()}`;
+    res.send(authUrl);
+  }
+
+  /** Zoho OAuth callback: exchange code for token and save (GET /orchestration/zoho/callback). */
+  @Get('zoho/callback')
+  async zohoCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('location') location: string,
+    @Query('error') error: string,
+    @Res() res: Response,
+  ) {
+    if (error) {
+      res.send(this.closePopupHtml(`Zoho OAuth error: ${error}`));
+      return;
+    }
+    if (!code || !state) {
+      res.send(this.closePopupHtml('Missing code or state. Try connecting again.'));
+      return;
+    }
+    let userId: string;
+    try {
+      const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+      userId = (decoded?.userId || '').trim() || '000000000000000000000001';
+    } catch {
+      res.send(this.closePopupHtml('Invalid state. Try connecting again.'));
+      return;
+    }
+    const clientId = (process.env.ZOHO_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.ZOHO_CLIENT_SECRET || '').trim();
+    const redirectUri = this.getZohoRedirectUri();
+    if (!clientId || !clientSecret) {
+      res.send(this.closePopupHtml('Zoho OAuth not configured.'));
+      return;
+    }
+    const { authUrl: zohoAuthBase, baseUrl: zohoCrmBase } = this.getZohoRegionUrls(location);
+    try {
+      const tokenRes = await fetch(`${zohoAuthBase}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+          code,
+        }),
+      });
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
+      if (tokens.error || !tokens.access_token) {
+        res.send(this.closePopupHtml(`Zoho token error: ${tokens.error_description || tokens.error || 'Unknown'}`));
+        return;
+      }
+      const accessToken = tokens.access_token as string;
+      const refreshToken = (tokens.refresh_token as string) || '';
+      const userRes = await fetch(`${zohoCrmBase}/crm/v8/users?type=CurrentUser`, {
+        headers: {
+          Authorization: `Zoho-oauthtoken ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const userData = (await userRes.json()) as ZohoUsersData;
+      const users = userData?.users || [];
+      const fullName = users[0]?.full_name ?? '';
+      const email = users[0]?.email ?? '';
+      const existing = await this.integrationHub.getZohoAccounts(userId);
+      if (existing.some((a: any) => a.email === email)) {
+        res.send(
+          `<!DOCTYPE html><html><body><script>window.opener && window.opener.postMessage({ type: 'OAUTH_ERROR', error: 'Email already connected' }, '*');</script><p>This email is already connected to Zoho.</p></body></html>`,
+        );
+        return;
+      }
+      const accountId = await this.integrationHub.saveZohoOAuthAccount(userId, {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        email: email || undefined,
+        user_name: fullName || email || undefined,
+        location: location || undefined,
+      });
+      res.send(this.closePopupHtml(null, accountId));
+    } catch (e: any) {
+      res.send(this.closePopupHtml(e?.message || 'Failed to complete Zoho sign-in.'));
     }
   }
 

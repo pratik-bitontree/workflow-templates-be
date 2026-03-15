@@ -16,6 +16,7 @@ const userSecretKeyMap: Record<string, string> = {
   hubspot: 'hubspot',
   instantly: 'instantly',
   calendly: 'calendly',
+  cal: 'cal',
   zoho: 'zoho',
   vercel: 'vercel',
   openai: 'openai',
@@ -32,6 +33,7 @@ const connectionMethodMap: Record<string, { apiKey: boolean; oauth: boolean }> =
   gcalendar: { apiKey: false, oauth: true },
   hubspot: { apiKey: false, oauth: true },
   calendly: { apiKey: false, oauth: true },
+  cal: { apiKey: true, oauth: false },
   zoho: { apiKey: false, oauth: true },
   vercel: { apiKey: true, oauth: false },
   openai: { apiKey: true, oauth: false },
@@ -285,6 +287,102 @@ export class IntegrationHubService {
       { upsert: true },
     );
     return newAccountId.toString();
+  }
+
+  async saveCalendlyOAuthAccount(
+    userId: string,
+    data: {
+      access_token: string;
+      refresh_token: string;
+      email?: string;
+      user_name?: string;
+      meta?: { user_uri?: string; organization_uri?: string };
+    },
+  ): Promise<string> {
+    const key = 'calendly';
+    let doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.[key]) ? [...(doc as any)[key]] : [];
+    const newAccountId = new Types.ObjectId();
+    const newAccount = {
+      accountId: newAccountId,
+      connectionType: 'oauth',
+      email: data.email ?? null,
+      user_name: data.user_name ?? data.email ?? null,
+      isPrimary: accounts.length === 0,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      created_at: new Date(),
+      meta: data.meta ?? {},
+    };
+    accounts.push(newAccount);
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { [key]: accounts } },
+      { upsert: true },
+    );
+    return newAccountId.toString();
+  }
+
+  async getZohoAccounts(userId: string): Promise<{ email?: string }[]> {
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = (doc as any)?.zoho;
+    return Array.isArray(accounts) ? accounts : [];
+  }
+
+  async saveZohoOAuthAccount(
+    userId: string,
+    data: {
+      access_token: string;
+      refresh_token: string;
+      email?: string;
+      user_name?: string;
+      location?: string;
+    },
+  ): Promise<string> {
+    const key = 'zoho';
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.[key]) ? [...(doc as any)[key]] : [];
+    const newAccountId = new Types.ObjectId();
+    const newAccount = {
+      accountId: newAccountId,
+      connectionType: 'oauth',
+      email: data.email ?? null,
+      user_name: data.user_name ?? data.email ?? null,
+      isPrimary: accounts.length === 0,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      created_at: new Date(),
+      location: data.location ?? null,
+    };
+    accounts.push(newAccount);
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { [key]: accounts } },
+      { upsert: true },
+    );
+    return newAccountId.toString();
+  }
+
+  /**
+   * Update the primary Calendly account's access_token and refresh_token (e.g. after refresh).
+   * Calendly uses single-use refresh tokens; always persist the new refresh_token from the response.
+   */
+  async updateCalendlyTokens(
+    userId: string,
+    data: { access_token: string; refresh_token: string },
+  ): Promise<void> {
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.calendly) ? [...(doc as any).calendly] : [];
+    const primaryIndex = accounts.findIndex((a: any) => a.isPrimary);
+    const idx = primaryIndex >= 0 ? primaryIndex : 0;
+    if (accounts.length === 0) {
+      throw new Error('Calendly not connected. Connect Calendly in Integration Hub first.');
+    }
+    accounts[idx] = { ...accounts[idx], access_token: data.access_token, refresh_token: data.refresh_token };
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { calendly: accounts } },
+    );
   }
 
   getOAuthLoginUrl(service: string, userId: string): string {

@@ -96,8 +96,14 @@ export class WorkflowQueueProcessor extends WorkerHost {
           : undefined;
       params = resolveDynamicParams(params, workflowInput, dynamicParamKeys) as Record<string, unknown>;
 
+      // Agents nodes: run Candidate Profile Analyzer in-process (no webhook)
+      const isAgentsJob = (jobType ?? data?.type ?? '').toString().toLowerCase() === 'agents';
       const resolvedFn =
-        fn === 'executeNode' ? 'processInput' : (fn || 'processInput');
+        isAgentsJob
+          ? 'runAgent'
+          : fn === 'executeNode'
+            ? 'processInput'
+            : (fn || 'processInput');
 
       returnvalue = await this.actionService.executeWorkflowFunction(
         {
@@ -109,6 +115,7 @@ export class WorkflowQueueProcessor extends WorkerHost {
         {
           nodeExecutionId,
           workflowExecutionId,
+          workflowId,
           nodeId,
           nodeMasterId,
         },
@@ -147,6 +154,20 @@ export class WorkflowQueueProcessor extends WorkerHost {
         typeof returnvalue === 'object' &&
         Object.keys(returnvalue).length > 0
       ) {
+        // Store per-fanout iteration so scheduler can build loop[] with each row's result
+        if (
+          workflowExecutionId &&
+          nodeExecutionId &&
+          fanoutIndex != null &&
+          typeof fanoutIndex === 'number'
+        ) {
+          await this.cache.addFanoutIterationResult(
+            workflowExecutionId,
+            nodeExecutionId,
+            fanoutIndex,
+            returnvalue as Record<string, unknown>,
+          );
+        }
         for (const [k, v] of Object.entries(returnvalue)) {
           if (k.startsWith('__')) continue;
           if (v === null || v === undefined) continue;

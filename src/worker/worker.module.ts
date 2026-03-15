@@ -10,8 +10,13 @@ import { ToolsService } from './services/tools.service';
 import { GmailService } from './services/gmail.service';
 import { InstantlyService } from './services/instantly.service';
 import { VercelService } from './services/vercel.service';
+import { GsheetsService } from './services/gsheets.service';
+import { CalService } from './services/cal.service';
+import { ZohoService } from './services/zoho.service';
+import { HubspotService } from './services/hubspot/hubspot.service';
 import { ApiKeyManager } from './rate-limitting/api-key-manager.service';
 import { RateLimiter } from './rate-limitting/rate-limiter.service';
+import { CandidateProfileExecutor } from './agent-executor/candidate-profile.executor';
 
 @Module({
   imports: [
@@ -34,6 +39,11 @@ import { RateLimiter } from './rate-limitting/rate-limiter.service';
     GmailService,
     InstantlyService,
     VercelService,
+    GsheetsService,
+    CalService,
+    ZohoService,
+    HubspotService,
+    CandidateProfileExecutor,
   ],
 })
 export class WorkerModule {}

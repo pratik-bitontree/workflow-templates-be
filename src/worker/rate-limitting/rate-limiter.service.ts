@@ -32,8 +32,15 @@ export class RateLimiter {
         return result;
       } catch (error: any) {
         attempts++;
-        // Auth errors (invalid/expired key) are not retriable — fail fast with real message
+        // Auth errors (401): try next API key if we have multiple (e.g. OPEN_AI_SECRET_KEY_1..4)
         if (this.isAuthError(error)) {
+          this.apiKeyManager.advanceToNextKey(config.provider);
+          if (attempts < maxAttempts) {
+            this.logger.warn(
+              `[RateLimiter] Key failed with 401 for ${config.provider}, trying next key (attempt ${attempts}/${maxAttempts}).`,
+            );
+            continue;
+          }
           throw error;
         }
         if (this.isRateLimitError(error)) {

@@ -8,9 +8,11 @@ import { IntegrationHubService } from './integration-hub.service';
 import { UserSecrets, UserSecretsSchema } from '../schemas/user-secrets.schema';
 import { ActivityLog, ActivityLogSchema } from '../schemas/activity-log.schema';
 import { NodeMaster, NodeMasterSchema } from '../schemas/node-master.schema';
+import { WorkflowModule } from '../workflow/workflow.module';
 
 @Module({
   imports: [
+    WorkflowModule,
     MongooseModule.forFeature([
       { name: UserSecrets.name, schema: UserSecretsSchema },
       { name: ActivityLog.name, schema: ActivityLogSchema },

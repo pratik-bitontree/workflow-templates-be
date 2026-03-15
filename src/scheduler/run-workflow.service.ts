@@ -142,13 +142,17 @@ export class RunWorkflowService {
   ) {
     const functionToExecute = node.functionToExecute || 'executeNode';
     const jobId = jobIdSuffix ? `${nodeExecutionId}${jobIdSuffix}` : nodeExecutionId;
+    const parameters = { ...(node.parameters || {}) };
+    if ((node as any).nextNodeId != null) {
+      parameters.nextNodeId = (node as any).nextNodeId?.toString?.() ?? String((node as any).nextNodeId);
+    }
     const payload: Record<string, unknown> = {
       type: node.type || 'action',
       workflowId,
       workflowExecutionId,
       nodeId: node._id?.toString?.() || node.id,
       nodeExecutionId,
-      parameters: node.parameters || {},
+      parameters,
       userId,
       functionToExecute,
       workflowInput: variables && Object.keys(variables).length > 0 ? variables : [],
@@ -303,13 +307,13 @@ export class RunWorkflowService {
     const wfId = (execution.workflowId as any)?._id ?? execution.workflowId;
     const allNodesRaw = await this.nodeModel
       .find({ workflowId: wfId })
-      .populate({ path: 'nodeMasterId', select: 'type functionToExecute dynamicParams' })
+      .populate({ path: 'nodeMasterId', select: 'type functionToExecute dynamicParams metaData' })
       .lean();
     const allNodes = (allNodesRaw as any[]).map((n: any) => ({
       ...n,
       functionToExecute: n.functionToExecute ?? n.nodeMasterId?.functionToExecute ?? 'processInput',
     }));
-    const variables = this.workflowCache.getVariables(workflowExecutionId);
+    let variables = this.workflowCache.getVariables(workflowExecutionId);
 
     const completedNodeId = (nodeExecution.nodeId as any)?.toString?.() ?? String(nodeExecution.nodeId);
     const completedNodeIdObj = nodeExecution.nodeId instanceof Types.ObjectId ? nodeExecution.nodeId : new Types.ObjectId(completedNodeId);
@@ -334,27 +338,111 @@ export class RunWorkflowService {
 
     this.logger.log(`[onNodeCompleted] completedNodeId=${completedNodeId} allNodes=${allNodes.length} dependents=${dependents.length} depIds=${dependents.map((d: any) => (d._id ?? d.id)?.toString?.()).join(',')}`);
 
-    // When an If (conditional) node completes: only enqueue the correct branch. If condition is true, enqueue "then" (e.g. Perplexity), not Else. If false, enqueue only Else.
-    const isCompletedIf = completedNode?.type === 'conditional_node' && (completedNode?.name === 'If' || (completedNode as any)?.metaData?.subType === 'if');
+    // Resolve Else branch nextNodeId (monorepo: from conditionalMetadata, nodeExecution, or node definition)
+    const conditionalNextNodeId = (data as any).conditionalMetadata?.nextNodeId != null
+      ? ((data as any).conditionalMetadata.nextNodeId?.toString?.() ?? String((data as any).conditionalMetadata.nextNodeId))
+      : null;
+    const nodeDefNextNodeId = (completedNode as any)?.nextNodeId != null
+      ? ((completedNode as any).nextNodeId?.toString?.() ?? String((completedNode as any).nextNodeId))
+      : null;
+    const actualNextNodeId = conditionalNextNodeId ?? (nodeExecution as any)?.nextNodeId?.toString?.() ?? nodeDefNextNodeId;
+
+    // When an If (conditional) node completes: match monorepo behavior.
+    // If TRUE: enqueue dependents excluding Else. If FALSE: do NOT enqueue Else; mark Else completed and enqueue Else's dependents only.
+    const ifSubType = (completedNode as any)?.nodeMasterId?.metaData?.subType ?? (completedNode as any)?.metaData?.subType;
+    const isCompletedIf = completedNode?.type === 'conditional_node' && (completedNode?.name === 'If' || ifSubType === 'if');
     const conditionTrue = nodeStatus === 'completed'; // for If nodes: completed => condition true, skipped => condition false
     let dependentsToConsider = dependents;
     if (isCompletedIf && dependents.length > 0) {
-      dependentsToConsider = dependents.filter((dep: any) => {
-        const isElse = dep?.name === 'Else' || (dep?.type === 'conditional_node' && (dep as any)?.metaData?.subType === 'else');
-        if (conditionTrue) {
-          if (isElse) {
-            this.logger.log(`[onNodeCompleted] If condition true: skip enqueueing Else nodeId=${(dep._id ?? dep.id)?.toString?.()}`);
-            return false;
+      if (!conditionTrue && actualNextNodeId) {
+        // IF FALSE (monorepo): mark Else node execution as completed, then enqueue only Else's dependents (e.g. Create ZOHO). Do not enqueue Else itself.
+        const elseNode = allNodes.find((n: any) => (n._id ?? n.id)?.toString?.() === actualNextNodeId);
+        if (elseNode) {
+          const elseNodeIdObj = elseNode._id ?? elseNode.id;
+          const elseNe = await this.nodeExecutionModel.findOne({
+            workflowExecutionId: executionIdObj,
+            nodeId: elseNodeIdObj instanceof Types.ObjectId ? elseNodeIdObj : new Types.ObjectId(String(elseNodeIdObj)),
+          });
+          if (elseNe) {
+            await this.nodeExecutionModel.updateOne(
+              { _id: elseNe._id },
+              { $set: { status: 'completed', endTimeStamp: new Date() } },
+            );
+            this.logger.log(`[onNodeCompleted] If condition false: marked Else node as completed nodeExecutionId=${elseNe._id} nextNodeId=${actualNextNodeId}`);
+            const elseDependents = allNodes.filter((n: any) =>
+              (n.dependencies || []).some((d: any) => (d?.toString?.() ?? String(d)) === (actualNextNodeId?.toString?.() ?? actualNextNodeId)),
+            );
+            for (const child of elseDependents) {
+              const childNe = await this.nodeExecutionModel.findOne({
+                workflowExecutionId: executionIdObj,
+                nodeId: child._id ?? child.id,
+              });
+              if (!childNe || (childNe.status !== 'pending' && childNe.status !== 'ready')) continue;
+              const childDeps = child.dependencies || [];
+              const allChildDepsDone = await Promise.all(
+                childDeps.map((d: any) => {
+                  const dObj = d instanceof Types.ObjectId ? d : new Types.ObjectId(String(d));
+                  return this.nodeExecutionModel.findOne({
+                    workflowExecutionId: executionIdObj,
+                    nodeId: dObj,
+                    status: { $in: ['completed', 'skipped'] },
+                  });
+                }),
+              );
+              if (!allChildDepsDone.every(Boolean)) continue;
+              this.logger.log(`[onNodeCompleted] If condition false: enqueueing Else dependent nodeId=${(child._id ?? child.id)?.toString?.()} nodeExecutionId=${childNe._id}`);
+              await this.enqueueNode(
+                (wfId as any)?.toString?.() ?? execution.workflowId?.toString?.() ?? data.workflowId,
+                workflowExecutionId,
+                (execution.userId as any)?.toString?.() ?? execution.userId,
+                child,
+                childNe._id.toString(),
+                variables,
+                allNodes,
+              );
+              if (childNe.status === 'pending') {
+                await this.nodeExecutionModel.updateOne(
+                  { _id: childNe._id },
+                  { $set: { status: 'ready', startTimeStamp: new Date() } },
+                );
+              }
+            }
           }
-          return true;
         }
-        // condition false: only enqueue Else
-        if (!isElse) {
-          this.logger.log(`[onNodeCompleted] If condition false: skip enqueueing then-branch nodeId=${(dep._id ?? dep.id)?.toString?.()} name=${dep?.name}`);
-          return false;
+        dependentsToConsider = [];
+      } else if (conditionTrue && actualNextNodeId) {
+        dependentsToConsider = dependents.filter((dep: any) => (dep._id ?? dep.id)?.toString?.() !== actualNextNodeId);
+        this.logger.log(`[onNodeCompleted] If condition true: enqueueing then-branch only, excluding nextNodeId=${actualNextNodeId} count=${dependentsToConsider.length}`);
+      } else {
+        const isElse = (dep: any) => dep?.name === 'Else' || (dep?.type === 'conditional_node' && ((dep as any)?.nodeMasterId?.metaData?.subType === 'else' || (dep as any)?.metaData?.subType === 'else'));
+        if (conditionTrue) {
+          dependentsToConsider = dependents.filter((dep: any) => !isElse(dep));
+        } else {
+          dependentsToConsider = dependents.filter(isElse);
+          if (dependentsToConsider.length > 0) {
+            const elseNode = dependentsToConsider[0];
+            const elseNodeIdStr = (elseNode._id ?? elseNode.id)?.toString?.();
+            const elseNe = await this.nodeExecutionModel.findOne({
+              workflowExecutionId: executionIdObj,
+              nodeId: elseNodeIdStr ? new Types.ObjectId(elseNodeIdStr) : (elseNode._id ?? elseNode.id),
+            });
+            if (elseNe) {
+              await this.nodeExecutionModel.updateOne({ _id: elseNe._id }, { $set: { status: 'completed', endTimeStamp: new Date() } });
+              const elseDependents = allNodes.filter((n: any) => (n.dependencies || []).some((d: any) => (d?.toString?.() ?? String(d)) === elseNodeIdStr));
+              for (const child of elseDependents) {
+                const childNe = await this.nodeExecutionModel.findOne({ workflowExecutionId: executionIdObj, nodeId: child._id ?? child.id });
+                if (!childNe || (childNe.status !== 'pending' && childNe.status !== 'ready')) continue;
+                const childDeps = child.dependencies || [];
+                const allChildDepsDone = await Promise.all(childDeps.map((d: any) => this.nodeExecutionModel.findOne({ workflowExecutionId: executionIdObj, nodeId: d instanceof Types.ObjectId ? d : new Types.ObjectId(String(d)), status: { $in: ['completed', 'skipped'] } })));
+                if (!allChildDepsDone.every(Boolean)) continue;
+                await this.enqueueNode((wfId as any)?.toString?.() ?? execution.workflowId?.toString?.() ?? data.workflowId, workflowExecutionId, (execution.userId as any)?.toString?.() ?? execution.userId, child, childNe._id.toString(), variables, allNodes);
+                if (childNe.status === 'pending') await this.nodeExecutionModel.updateOne({ _id: childNe._id }, { $set: { status: 'ready', startTimeStamp: new Date() } });
+              }
+            }
+            dependentsToConsider = [];
+          }
         }
-        return true;
-      });
+      }
     }
 
     // Only enqueue dependents when this node actually completed or was skipped (not failed / waiting_for_webhook)
@@ -368,6 +456,26 @@ export class RunWorkflowService {
             `[onNodeCompleted] fanout child nodeExecutionId=${nodeExecutionId} ${completed}/${fanoutTotal} - not enqueueing dependents yet`,
           );
           return;
+        }
+        if (completed === fanoutTotal) {
+          const batches = this.workflowCache.getFanoutBatches(workflowExecutionId, nodeExecutionId);
+          const results = this.workflowCache.getFanoutResults(workflowExecutionId, nodeExecutionId);
+          if (batches?.length && results.length) {
+            const variableName = (completedNode as any)?.parameters?.variableName ?? 'result';
+            const merged: unknown[] = [];
+            for (let bi = 0; bi < batches.length; bi++) {
+              const batch = (batches[bi] ?? []) as Record<string, unknown>[];
+              const iterResult = (results[bi] ?? {}) as Record<string, unknown>;
+              for (const row of batch) {
+                merged.push({ ...(row as object), [variableName]: iterResult });
+              }
+            }
+            await this.workflowCache.addOutputAsCache(workflowExecutionId, 'loop', merged);
+            variables = this.workflowCache.getVariables(workflowExecutionId);
+            this.logger.log(
+              `[onNodeCompleted] fanout merge complete nodeExecutionId=${nodeExecutionId} loop.length=${merged.length} variableName=${variableName}`,
+            );
+          }
         }
       }
 
@@ -536,6 +644,7 @@ export class RunWorkflowService {
               : fanoutArray.map((item) => [item]);
             const totalBatches = batches.length;
             this.workflowCache.setFanoutTotal(workflowExecutionId, childNe._id.toString(), totalBatches);
+            await this.workflowCache.setFanoutBatches(workflowExecutionId, childNe._id.toString(), batches);
             for (let bi = 0; bi < batches.length; bi++) {
               const batch = batches[bi] as Record<string, unknown>[];
               const firstItem = batch[0];
@@ -673,7 +782,8 @@ export class RunWorkflowService {
           }),
         );
         // Else node whose single dependency is an If that completed (then-branch taken): mark Else as skipped.
-        const isElseNode = node?.name === 'Else' || (node?.type === 'conditional_node' && (node as any)?.metaData?.subType === 'else');
+        const elseSubType = (node as any)?.nodeMasterId?.metaData?.subType ?? (node as any)?.metaData?.subType;
+        const isElseNode = node?.name === 'Else' || (node?.type === 'conditional_node' && elseSubType === 'else');
         if (deps.length === 1 && isElseNode && depStatuses[0] && (depStatuses[0] as any).status === 'completed') {
           await this.nodeExecutionModel.updateOne(
             { _id: ne._id },
@@ -683,6 +793,10 @@ export class RunWorkflowService {
             `[onNodeCompleted] marked Else node nodeExecutionId=${ne._id} as skipped (If condition was true)`,
           );
           markedAny = true;
+          continue;
+        }
+        // Do NOT mark Else as skipped when its only dependency is If with status 'skipped' (condition false).
+        if (deps.length === 1 && isElseNode && depStatuses[0] && (depStatuses[0] as any).status === 'skipped') {
           continue;
         }
         const allDepsTerminal = depStatuses.every(

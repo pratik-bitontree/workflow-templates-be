@@ -1655,7 +1655,7 @@
             "nodeMasterId": "67ac765fa07b458975f5bc96",
             "parameters": {
                 "trigger": "calendly",
-                "url": "https://testing.growstack.ai/automation/workflow/calendly/trigger-webhook?workflowId=69395ce0c34b379a2f42898b&nodeId=69395ceb9715d124ec997ed8&userId=691c10a081dda12cdda92524",
+                "url": "https://testing.growstack.ai/orchestration/workflow/calendly/trigger-webhook?workflowId=69395ce0c34b379a2f42898b&nodeId=69395ceb9715d124ec997ed8&userId=691c10a081dda12cdda92524",
                 "showInOutputPreviewTab": true,
                 "variableName": "trigger"
             },
@@ -2340,7 +2340,7 @@
             "nodeMasterId": "67ac765fa07b458975f5bc96",
             "parameters": {
                 "trigger": "instantly",
-                "url": "https://testing.growstack.ai/orchestration/workflow/instantly/trigger-webhook?workflowId=697b31d4604da76b94249b0a&nodeId=697b3596604da76b9424a944&userId=",
+                "url": "",
                 "showInOutputPreviewTab": true,
                 "variableName": "trigger"
             },
@@ -2401,7 +2401,7 @@
                     {
                         "subject": "${intent_segregation.content}",
                         "logic": "contains_insensitive",
-                        "value": "YES"
+                        "value": "follow up message"
                     }
                 ]
             },

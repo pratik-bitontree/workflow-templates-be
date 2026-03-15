@@ -17,6 +17,14 @@ export class ApiKeyManager {
 
   constructor(private configService: ConfigService) {}
 
+  /** Advance to next key for this provider (e.g. after 401 so we try another key). */
+  advanceToNextKey(provider: string): void {
+    const keys = this.getProviderKeys(provider);
+    if (keys.length <= 1) return;
+    const current = this.keyIndexes.get(provider) || 0;
+    this.keyIndexes.set(provider, (current + 1) % keys.length);
+  }
+
   async getNextAvailableKey(provider: string, userSecrets?: Record<string, any>): Promise<string> {
     const keys = this.getProviderKeys(provider, userSecrets);
     if (keys.length === 0) {
@@ -100,6 +108,7 @@ export class ApiKeyManager {
       anthropic: { rateLimitPerMinute: 1000 },
       groq: { rateLimitPerMinute: 5000 },
       gemini: { rateLimitPerMinute: 1000 },
+      perplexity: { rateLimitPerMinute: 1000 },
     };
     return configs[provider] ?? { rateLimitPerMinute: 1000 };
   }
@@ -123,14 +132,11 @@ export class ApiKeyManager {
 
     if (provider === 'openai') {
       const keys: string[] = [];
-      let i = 1;
-      while (true) {
+      for (let i = 1; i <= 10; i++) {
         const key =
           this.configService.get<string>(`OPEN_AI_SECRET_KEY_${i}`) ??
           this.configService.get<string>(`OPENAI_API_KEY_${i}`);
-        if (!key) break;
-        keys.push(key);
-        i++;
+        if (key && typeof key === 'string' && key.trim()) keys.push(key.trim());
       }
       if (keys.length === 0) {
         const singleKey =

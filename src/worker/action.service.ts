@@ -8,12 +8,29 @@ import { OAuth2Client } from 'google-auth-library';
 import { Types } from 'mongoose';
 import { UserSecrets, UserSecretsDocument } from '../schemas/user-secrets.schema';
 import { GmailService } from './services/gmail.service';
+import { GsheetsService } from './services/gsheets.service';
+import { CalService } from './services/cal.service';
 import { ToolsService } from './services/tools.service';
 import { InstantlyService } from './services/instantly.service';
 import { VercelService } from './services/vercel.service';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { RateLimiter } from './rate-limitting/rate-limiter.service';
+import {
+  deepResolveValue,
+  parseScheduleDays,
+  normalizeToTwentyFourHourTime,
+  normalizeToDateOnly,
+  splitString,
+  removeEmptyValues,
+} from './workflow-processor.utils';
+import { CandidateProfileExecutor } from './agent-executor/candidate-profile.executor';
+import {
+  ZohoService,
+  CreateZohoContactDto,
+  UpdateZohoContactDto,
+} from './services/zoho.service';
+import { HubspotService } from './services/hubspot/hubspot.service';
 
 /**
  * Action service for workflow node execution.
@@ -36,7 +53,12 @@ export class ActionService {
     private readonly toolsService: ToolsService,
     private readonly instantlyService: InstantlyService,
     private readonly vercelService: VercelService,
+    private readonly gsheetsService: GsheetsService,
+    private readonly calService: CalService,
     private readonly rateLimiter: RateLimiter,
+    private readonly candidateProfileExecutor: CandidateProfileExecutor,
+    private readonly zohoService: ZohoService,
+    private readonly hubspotService: HubspotService,
     @InjectModel(UserSecrets.name) private userSecretsModel: Model<UserSecretsDocument>,
   ) {
     const initialKey = this.configService.get<string>('OPEN_AI_SECRET_KEY_1') ?? this.configService.get<string>('OPEN_AI_SECRET_KEY') ?? '';
@@ -172,15 +194,57 @@ export class ActionService {
     }
   }
 
+  /** Find a Google Sheets URL from workflow input (e.g. form field "Candidate Sheet", "Campaign Sheet"). */
+  private getSpreadsheetUrlFromInput(input: Record<string, unknown> | undefined): string | undefined {
+    if (!input || typeof input !== 'object') return undefined;
+    const sheetUrlPattern = /https?:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9-_]+/;
+    const directKeys = ['spreadsheetUrl', 'spreadsheet_url', 'Candidate Sheet', 'Campaign Sheet', 'Spreadsheet URL', 'sheetUrl', 'sheet_url'];
+    for (const k of directKeys) {
+      const v = input[k];
+      if (typeof v === 'string' && sheetUrlPattern.test(v)) return v;
+    }
+    const findIn = (obj: unknown): string | undefined => {
+      if (typeof obj !== 'object' || obj === null) return undefined;
+      const o = obj as Record<string, unknown>;
+      for (const key of directKeys) {
+        const v = o[key];
+        if (typeof v === 'string' && sheetUrlPattern.test(v)) return v;
+      }
+      for (const v of Object.values(o)) {
+        if (typeof v === 'string' && sheetUrlPattern.test(v)) return v;
+        const nested = findIn(v);
+        if (nested) return nested;
+      }
+      return undefined;
+    };
+    return findIn(input);
+  }
+
   /**
-   * Resolve ${variableName} in a string using input (workflow variables).
+   * Resolve ${variableName.path.to.value} using input (workflow variables).
+   * Supports nested keys; when a segment is an array, uses the first element for the next key
+   * (e.g. search_records_zoho_crm.data.Email when data is [{ Email: "x" }] → "x").
    */
   private resolvePlaceholder(val: unknown, input: Record<string, unknown> | undefined): unknown {
     if (typeof val !== 'string' || !input || typeof input !== 'object') return val;
     const match = val.match(/^\$\{(.+)\}$/);
     if (!match) return val;
-    const key = match[1].trim().split('.')[0];
-    const v = input[key];
+    const path = match[1].trim();
+    const keys = path.split('.');
+    let v: unknown = input[keys[0]];
+    if (v === undefined || v === null) return '';
+    for (let i = 1; i < keys.length; i++) {
+      const key = keys[i];
+      if (v === undefined || v === null) return '';
+      if (Array.isArray(v)) {
+        const first = (v as unknown[])[0];
+        v = first != null && typeof first === 'object' && key in first ? (first as Record<string, unknown>)[key] : undefined;
+      } else if (typeof v === 'object' && key in (v as Record<string, unknown>)) {
+        v = (v as Record<string, unknown>)[key];
+      } else {
+        v = undefined;
+      }
+    }
     return v === undefined || v === null ? '' : v;
   }
 
@@ -314,6 +378,108 @@ export class ActionService {
       default:
         throw new Error(`Unsupported condition mode: ${conditionMode}`);
     }
+  }
+
+  /**
+   * Parse and transform text (ported from monorepo tools.service parseText).
+   * Used by Parse Text node in Calendly→Zoho and similar workflows.
+   */
+  async parseText(options: {
+    text: string;
+    trimSpaces?: boolean;
+    removeNumbers?: boolean;
+    convertToTitleCase?: boolean;
+    specialCharactersToRemove?: string[];
+    removeAllSpecialCharsKeepSpace?: boolean;
+    extractArray?: boolean;
+    extractJSON?: boolean;
+  }): Promise<string> {
+    let result = options.text ?? '';
+    if (typeof result !== 'string') return '';
+    if (!result) return '';
+
+    if (options.extractArray) {
+      const extracted = this.extractArrayFromPlainText(result);
+      if (extracted != null) result = extracted;
+    }
+    if (options.extractJSON) {
+      const extracted = this.extractObjectFromPlainText(result);
+      if (extracted != null) result = extracted;
+    }
+    if (options.specialCharactersToRemove?.length) {
+      result = this.removeSpecificCharacters(result, options.specialCharactersToRemove);
+    }
+    if (options.removeAllSpecialCharsKeepSpace) {
+      result = this.removeAllSpecialCharacters(result);
+    }
+    if (options.removeNumbers) {
+      result = this.removeNumbersFromString(result);
+    }
+    if (options.trimSpaces) {
+      result = this.removeExtraSpaces(result);
+    }
+    if (options.convertToTitleCase) {
+      result = this.toTitleCase(result);
+    }
+    return result;
+  }
+
+  private removeSpecificCharacters(input: string, charsToRemove: string[]): string {
+    if (!input || typeof input !== 'string') return '';
+    if (!charsToRemove?.length) return input;
+    const escaped = charsToRemove.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    return input.replace(new RegExp(`[${escaped.join('')}]`, 'g'), '');
+  }
+
+  private removeAllSpecialCharacters(input: string): string {
+    if (!input || typeof input !== 'string') return '';
+    return input.replace(/[^a-zA-Z0-9\s]/g, '');
+  }
+
+  private removeNumbersFromString(input: string): string {
+    if (!input || typeof input !== 'string') return '';
+    return input.replace(/[0-9]/g, '');
+  }
+
+  private removeExtraSpaces(input: string): string {
+    if (!input || typeof input !== 'string') return '';
+    return input.replace(/\s+/g, ' ').trim();
+  }
+
+  private toTitleCase(input: string): string {
+    if (!input || typeof input !== 'string') return '';
+    return input.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
+  }
+
+  private extractArrayFromPlainText(text: string): string | null {
+    const arrayPattern = /\[\s*(?:[^\[\]]*(?:\[[^\[\]]*\])*[^\[\]]*)*\]/gs;
+    const matches = text.match(arrayPattern);
+    if (!matches?.length) return null;
+    for (const match of matches) {
+      try {
+        const parsed = JSON.parse(match.trim());
+        if (Array.isArray(parsed)) return match.trim();
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  private extractObjectFromPlainText(text: string): string | null {
+    const objectPattern = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/gs;
+    const matches = text.match(objectPattern);
+    if (!matches?.length) return null;
+    const sorted = matches.sort((a, b) => b.length - a.length);
+    for (const match of sorted) {
+      try {
+        const parsed = JSON.parse(match.trim());
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) return match.trim();
+      } catch {
+        continue;
+      }
+    }
+    return null;
   }
 
   async processSendEmail({
@@ -1004,6 +1170,117 @@ export class ActionService {
   }
 
   /**
+   * List Instantly custom tags (for sender email tags in campaign). Used by Automated Email Outreach template.
+   * Params: userId, search (optional), limit (optional), startingAfter (optional).
+   */
+  async listInstantlyCustomTags(
+    params: Record<string, unknown>,
+    _context?: { workflowInput?: Record<string, unknown> },
+  ): Promise<unknown> {
+    const userId = (params?.userId ?? params?.user_id) as string;
+    if (!userId) throw new BadRequestException('listInstantlyCustomTags requires userId');
+    const search = (params?.search ?? '') as string;
+    const limit = params?.limit != null ? Number(params.limit) : undefined;
+    const startingAfter = (params?.startingAfter ?? params?.starting_after ?? '') as string;
+    return this.instantlyService.listCustomTags(userId, {
+      search: search || undefined,
+      limit,
+      starting_after: startingAfter || undefined,
+    });
+  }
+
+  /**
+   * Create Instantly campaign. Used by Automated Email Outreach Campaign template.
+   * Params: name, scheduleName, scheduleTimeFrom, scheduleTimeTo, scheduleTimezone, scheduleDays,
+   * scheduleStartDate, scheduleEndDate, isEvergreen, sequences, emailTagList, dailyLimit, stopOnReply, etc.
+   */
+  async createInstantlyCampaign(
+    params: Record<string, unknown>,
+    _context?: { workflowInput?: Record<string, unknown> },
+  ): Promise<unknown> {
+    const userId = (params?.userId ?? params?.user_id) as string;
+    if (!userId) throw new BadRequestException('createInstantlyCampaign requires userId');
+    const name = (params?.name ?? '') as string;
+    const scheduleName = (params?.scheduleName ?? params?.schedule_name ?? name) as string;
+    const scheduleTimeFrom = (params?.scheduleTimeFrom ?? params?.schedule_time_from ?? '') as string;
+    const scheduleTimeTo = (params?.scheduleTimeTo ?? params?.schedule_time_to ?? '') as string;
+    const scheduleTimezone = (params?.scheduleTimezone ?? params?.schedule_timezone ?? 'UTC') as string;
+    const scheduleDaysRaw = params?.scheduleDays ?? params?.schedule_days;
+    const scheduleDays: string | string[] | number[] =
+      typeof scheduleDaysRaw === 'string' || Array.isArray(scheduleDaysRaw) ? scheduleDaysRaw : [];
+    const scheduleStartDate = (params?.scheduleStartDate ?? params?.schedule_start_date ?? '') as string;
+    const scheduleEndDate = (params?.scheduleEndDate ?? params?.schedule_end_date ?? '') as string;
+    const isEvergreen = Boolean(params?.isEvergreen ?? params?.is_evergreen ?? true);
+    const sequences = (params?.sequences ?? []) as Array<{ delay?: string | number; subject?: string; emailBody?: string }>;
+    const emailTagListRaw = params?.emailTagList ?? params?.email_tag_list ?? '';
+    const emailTagList = Array.isArray(emailTagListRaw)
+      ? (emailTagListRaw as string[]).filter(Boolean)
+      : splitString(emailTagListRaw);
+    const dailyLimit = params?.dailyLimit ?? params?.daily_limit;
+    const stopOnReply = Boolean(params?.stopOnReply ?? params?.stop_on_reply ?? true);
+    const linkTracking = Boolean(params?.linkTracking ?? params?.link_tracking ?? true);
+    const openTracking = Boolean(params?.openTracking ?? params?.open_tracking ?? true);
+    const dailyMaxLeads = params?.dailyMaxLeads ?? params?.daily_max_leads;
+    const prioritizeNewLeads = Boolean(params?.prioritizeNewLeads ?? params?.prioritize_new_leads ?? false);
+    const emailSenderList = (params?.emailSenderList ?? params?.email_list ?? '') as string;
+    const emailGap = params?.emailGap ?? params?.email_gap;
+    const randomWaitMax = params?.randomWaitMax ?? params?.random_wait_max;
+    const textOnlyEmails = Boolean(params?.textOnlyEmails ?? params?.text_only ?? false);
+    const allowRiskyContacts = Boolean(params?.allowRiskyContacts ?? params?.allow_risky_contacts ?? false);
+    const positiveLeadValue = params?.positiveLeadValue ?? params?.pl_value;
+
+    const fromTime = scheduleTimeFrom ? normalizeToTwentyFourHourTime(scheduleTimeFrom) : '';
+    const toTime = scheduleTimeTo ? normalizeToTwentyFourHourTime(scheduleTimeTo) : '';
+    const startDate = scheduleStartDate ? normalizeToDateOnly(scheduleStartDate) : '';
+    const endDate = scheduleEndDate ? normalizeToDateOnly(scheduleEndDate) : '';
+
+    const steps = sequences.map((s) => ({
+      type: 'email',
+      delay: s.delay != null ? Number(s.delay) : undefined,
+      variants: [{ subject: (s.subject ?? '').toString(), body: (s.emailBody ?? '').toString() }],
+    }));
+
+    const parsedDayNumbers = parseScheduleDays(scheduleDays);
+    const daysOfObj = parsedDayNumbers.reduce((acc, dayNum) => {
+      acc[dayNum.toString()] = true;
+      return acc;
+    }, {} as Record<string, boolean>);
+
+    const payload = removeEmptyValues({
+      name,
+      campaign_schedule: {
+        schedules: [
+          {
+            name: scheduleName,
+            timing: { from: fromTime, to: toTime },
+            timezone: scheduleTimezone,
+            days: daysOfObj,
+          },
+        ],
+        ...(startDate && { start_date: startDate }),
+        ...(endDate && { end_date: endDate }),
+      },
+      allow_risky_contacts: allowRiskyContacts,
+      is_evergreen: isEvergreen,
+      pl_value: positiveLeadValue != null && positiveLeadValue !== '' ? Number(positiveLeadValue) : undefined,
+      sequences: sequences.length > 0 ? [{ steps }] : undefined,
+      email_gap: emailGap != null && emailGap !== '' ? Number(emailGap) : undefined,
+      random_wait_max: randomWaitMax != null && randomWaitMax !== '' ? Number(randomWaitMax) : undefined,
+      text_only: textOnlyEmails,
+      email_list: emailSenderList ? splitString(emailSenderList) : undefined,
+      daily_limit: dailyLimit != null && dailyLimit !== '' ? Number(dailyLimit) : undefined,
+      stop_on_reply: stopOnReply,
+      link_tracking: linkTracking,
+      open_tracking: openTracking,
+      daily_max_leads: dailyMaxLeads != null && dailyMaxLeads !== '' ? Number(dailyMaxLeads) : undefined,
+      prioritize_new_leads: prioritizeNewLeads,
+      email_tag_list: emailTagList.length > 0 ? emailTagList : undefined,
+    });
+
+    return this.instantlyService.createCampaign(userId, payload as any);
+  }
+
+  /**
    * Read Google Sheet data; returns { GridData: { headers, data } } for use in fanout/loop.
    * Params: spreadsheetUrl, userId; optional: dataRange, sheetData, rowsToRetrieve.
    */
@@ -1299,6 +1576,227 @@ export class ActionService {
   }
 
   /**
+   * Refresh Calendly OAuth access token using refresh_token. Calendly uses single-use refresh tokens;
+   * the new refresh_token from the response must be stored for the next refresh.
+   */
+  private async refreshCalendlyToken(userId: string, refreshToken: string): Promise<{ access_token: string; refresh_token: string }> {
+    const clientId = this.configService.get<string>('CALENDLY_CLIENT_ID');
+    const clientSecret = this.configService.get<string>('CALENDLY_CLIENT_SECRET');
+    if (!clientId || !clientSecret) {
+      throw new BadRequestException('Calendly OAuth not configured (CALENDLY_CLIENT_ID, CALENDLY_CLIENT_SECRET). Cannot refresh token.');
+    }
+    const tokenRes = await axios.post(
+      'https://auth.calendly.com/oauth/token',
+      new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: clientId,
+        client_secret: clientSecret,
+      }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 },
+    );
+    const access_token = tokenRes.data?.access_token;
+    const refresh_token = tokenRes.data?.refresh_token ?? refreshToken;
+    if (!access_token) {
+      throw new BadRequestException('Calendly token refresh failed: no access_token in response.');
+    }
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.calendly) ? [...(doc as any).calendly] : [];
+    const primaryIndex = accounts.findIndex((a: any) => a.isPrimary);
+    const idx = primaryIndex >= 0 ? primaryIndex : 0;
+    if (accounts.length === 0) throw new BadRequestException('Calendly not connected.');
+    accounts[idx] = { ...accounts[idx], access_token, refresh_token };
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { calendly: accounts } },
+    );
+    return { access_token, refresh_token };
+  }
+
+  /**
+   * Register a webhook with Calendly for the given user (mirrors monorepo registerWebhookForCalendly).
+   * Requires user to have Calendly connected in Integration Hub. Refreshes access token if Calendly returns "invalid".
+   */
+  async registerWebhookForCalendly({
+    userId,
+    eventTypes,
+    workflowURL,
+  }: {
+    userId: string;
+    eventTypes: string[] | string;
+    workflowURL: string;
+  }): Promise<Record<string, unknown>> {
+    if (!userId) {
+      throw new BadRequestException('userId is required for registerWebhookForCalendly');
+    }
+    const doc = await this.userSecretsModel
+      .findOne({ user_id: new Types.ObjectId(userId) })
+      .select('calendly')
+      .lean();
+    const calendlyAccounts = (doc as any)?.calendly;
+    if (!Array.isArray(calendlyAccounts) || calendlyAccounts.length === 0) {
+      throw new BadRequestException('Calendly not authenticated. Please connect Calendly in Integration Hub first.');
+    }
+    const primary = calendlyAccounts.find((acc: any) => acc?.isPrimary) || calendlyAccounts[0];
+    let accessToken = primary?.access_token;
+    const refreshToken = primary?.refresh_token;
+    const userUri = primary?.meta?.user_uri;
+    const organizationUri = primary?.meta?.organization_uri;
+    if (!accessToken) {
+      throw new BadRequestException('Calendly not authenticated. Please re-authenticate with Calendly.');
+    }
+    if (!userUri || !organizationUri) {
+      throw new BadRequestException('Calendly user URI not found. Please re-authenticate with Calendly.');
+    }
+    const eventsArray = Array.isArray(eventTypes)
+      ? eventTypes
+      : typeof eventTypes === 'string'
+        ? eventTypes.split(',').map((e) => e.trim()).filter(Boolean)
+        : [];
+    if (!workflowURL || !eventsArray.length) {
+      throw new BadRequestException('workflowURL and events are required');
+    }
+    if (!workflowURL.startsWith('https://')) {
+      throw new BadRequestException('workflowURL must be a valid HTTPS URL');
+    }
+    const payload = {
+      url: workflowURL,
+      events: eventsArray,
+      organization: organizationUri,
+      user: userUri,
+      scope: 'user',
+    };
+
+    const callCalendly = (token: string) =>
+      axios.post('https://api.calendly.com/webhook_subscriptions', payload, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+    try {
+      const { data } = await callCalendly(accessToken);
+      return data as Record<string, unknown>;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const message = (err?.response?.data?.message ?? err?.message ?? '') as string;
+      const isTokenInvalid = status === 401 || (message && message.toLowerCase().includes('access token') && message.toLowerCase().includes('invalid'));
+      if (isTokenInvalid && refreshToken) {
+        try {
+          const refreshed = await this.refreshCalendlyToken(userId, refreshToken);
+          const { data } = await callCalendly(refreshed.access_token);
+          return data as Record<string, unknown>;
+        } catch (retryErr: any) {
+          this.logger.error(
+            `Calendly webhook register failed after token refresh: ${(retryErr as Error)?.message}`,
+            (retryErr as Error)?.stack,
+            { response: (retryErr as any)?.response?.data },
+          );
+          const retryMessage = (retryErr as any)?.response?.data?.message ?? (retryErr as Error)?.message ?? 'Failed to register Calendly webhook after refresh. Reconnect Calendly in Integration Hub.';
+          throw new BadRequestException(retryMessage);
+        }
+      }
+      this.logger.error(
+        `Error in registerWebhookForCalendly: ${err?.message ?? err}`,
+        err?.stack,
+        { response: err?.response?.data ?? err },
+      );
+      const errMessage = err?.response?.data?.message ?? err?.message ?? 'Failed to register Calendly webhook. If you see "access token is invalid", reconnect Calendly in Integration Hub.';
+      throw new BadRequestException(errMessage);
+    }
+  }
+
+  /** Zoho CRM: search records (used by Calendly → Zoho template). */
+  async searchRecordsZohoCRM(
+    params: Record<string, unknown>,
+    _context?: { workflowInput?: Record<string, unknown> },
+  ): Promise<any> {
+    const userId = (params?.userId ?? params?.user_id ?? _context?.workflowInput?.userId ?? _context?.workflowInput?.user_id) as string;
+    if (!userId) throw new BadRequestException('userId is required for searchRecordsZohoCRM');
+    const moduleName = (params?.moduleName ?? params?.ModuleName) as string;
+    const searchType = (params?.searchType ?? params?.SearchType ?? 'filter') as string;
+    const recordIds = params?.recordIds as string | undefined;
+    const filters = (params?.filters ?? params?.Filters) as any[] | undefined;
+    const filterLogic = (params?.filterLogic ?? params?.FilterLogic ?? 'and') as string;
+    const customLogicExpression = (params?.customLogicExpression ?? params?.CustomLogicExpression) as string | undefined;
+    const dto = {
+      ModuleName: moduleName,
+      SearchType: searchType,
+      RecordIds: typeof recordIds === 'string' ? recordIds.split(',').map((s) => s.trim()) : recordIds,
+      Filters: filters,
+      FilterLogic: filterLogic,
+      CustomLogicExpression: customLogicExpression,
+    };
+    return this.zohoService.searchRecordsZohoCRM(userId, dto);
+  }
+
+  /** Zoho CRM: create contact (used by Calendly → Zoho template). */
+  async createContactRecordZohoCRM(
+    params: Record<string, unknown>,
+    _context?: { workflowInput?: Record<string, unknown> },
+  ): Promise<any> {
+    const userId = (params?.userId ?? params?.user_id ?? _context?.workflowInput?.userId ?? _context?.workflowInput?.user_id) as string;
+    if (!userId) throw new BadRequestException('userId is required for createContactRecordZohoCRM');
+    const dto: CreateZohoContactDto = {
+      Email: params?.email as string | undefined,
+      First_Name: params?.firstName as string | undefined,
+      Last_Name: (params?.lastName as string) ?? '',
+      Date_of_Birth: params?.dateOfBirth as string | undefined,
+      Lead_Source: params?.leadSource as string | undefined,
+      Title: params?.title as string | undefined,
+      Phone: params?.phone as string | undefined,
+      Department: params?.department as string | undefined,
+      Home_Phone: params?.homePhone as string | undefined,
+      Other_Phone: params?.otherPhone as string | undefined,
+      Mobile: params?.mobile as string | undefined,
+      Fax: params?.fax as string | undefined,
+      Assistant: params?.assistant as string | undefined,
+      Asst_Phone: params?.asstPhone as string | undefined,
+      Skype_ID: params?.skypeId as string | undefined,
+      Secondary_Email: params?.secondaryEmail as string | undefined,
+      Twitter: params?.twitter as string | undefined,
+      Account_Name: params?.accountName as string | undefined,
+      additionalFields: (params?.additionalFields as Record<string, string>) || {},
+    };
+    return this.zohoService.createContactRecordZohoCRM(userId, dto);
+  }
+
+  /** Zoho CRM: update contact (used by Calendly → Zoho template). */
+  async updateContactRecordZohoCRM(
+    params: Record<string, unknown>,
+    _context?: { workflowInput?: Record<string, unknown> },
+  ): Promise<any> {
+    const userId = (params?.userId ?? params?.user_id ?? _context?.workflowInput?.userId ?? _context?.workflowInput?.user_id) as string;
+    if (!userId) throw new BadRequestException('userId is required for updateContactRecordZohoCRM');
+    const recordId = (params?.recordId ?? params?.record_id) as string;
+    if (!recordId) throw new BadRequestException('recordId is required for updateContactRecordZohoCRM');
+    const dto: UpdateZohoContactDto = {
+      recordId,
+      Email: params?.email as string | undefined,
+      First_Name: params?.firstName as string | undefined,
+      Last_Name: (params?.lastName as string) ?? '',
+      Date_of_Birth: params?.dateOfBirth as string | undefined,
+      Lead_Source: params?.leadSource as string | undefined,
+      Title: params?.title as string | undefined,
+      Phone: params?.phone as string | undefined,
+      Department: params?.department as string | undefined,
+      Home_Phone: params?.homePhone as string | undefined,
+      Other_Phone: params?.otherPhone as string | undefined,
+      Mobile: params?.mobile as string | undefined,
+      Fax: params?.fax as string | undefined,
+      Assistant: params?.assistant as string | undefined,
+      Asst_Phone: params?.asstPhone as string | undefined,
+      Skype_ID: params?.skypeId as string | undefined,
+      Secondary_Email: params?.secondaryEmail as string | undefined,
+      Twitter: params?.twitter as string | undefined,
+      Account_Name: params?.accountName as string | undefined,
+      additionalFields: (params?.additionalFields as Record<string, string>) || {},
+    };
+    return this.zohoService.updateContactRecordZohoCRM(userId, dto);
+  }
+
+  /**
    * Generic entry point: execute the function for a node and return output map
    * { [variableName]: value } for the worker to cache.
    */
@@ -1317,6 +1815,7 @@ export class ActionService {
     _context?: {
       nodeExecutionId?: string;
       workflowExecutionId?: string;
+      workflowId?: string;
       fanoutExecutionId?: string;
       fanoutIterationKey?: string | number;
       nodeId?: string;
@@ -1325,6 +1824,57 @@ export class ActionService {
   ): Promise<Record<string, unknown>> {
     const outputMap: Record<string, unknown> = {};
     const variableName = (params?.['variableName'] ?? params?.variableName) as string | undefined;
+
+    // In-process Candidate Profile Analyzer (no webhook): run agent in worker
+    if (fn === 'runAgent') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string | undefined;
+      if (!userId) {
+        throw new BadRequestException('userId is required for runAgent');
+      }
+      const initialInstance = workflowInput?.initial_instance as Record<string, unknown> | undefined;
+      const loop = workflowInput?.loop;
+      const loopRow = Array.isArray(loop) ? loop[0] : (typeof loop === 'object' && loop !== null ? loop : null);
+      const resume =
+        initialInstance?.Resume ??
+        (initialInstance as any)?.resume ??
+        (loopRow && (loopRow as any).Resume) ??
+        (loopRow && (loopRow as any).resume) ??
+        params?.Resume ??
+        workflowInput?.Resume ??
+        (workflowInput?.read_data_from_sheet as any)?.GridData?.data?.[0]?.Resume;
+      const processedInputs: Record<string, any> = {
+        ...params,
+        JobDescription: workflowInput?.job_description ?? params?.JobDescription ?? params?.job_description ?? workflowInput?.JobDescription,
+        CompanyName: workflowInput?.company_name ?? params?.CompanyName ?? params?.company_name ?? workflowInput?.CompanyName,
+        job_description: workflowInput?.job_description ?? params?.job_description,
+        company_name: workflowInput?.company_name ?? params?.company_name,
+        Resume: resume ?? params?.Resume ?? params?.CandidateProfile,
+        CandidateProfile: resume ?? params?.CandidateProfile ?? params?.Resume,
+      };
+      if (!CandidateProfileExecutor.canHandle(processedInputs)) {
+        throw new BadRequestException(
+          'Candidate Profile Analyzer requires Resume (or CandidateProfile) and job_description or company_name. Other agents are not supported for in-process execution.',
+        );
+      }
+      const userSecretsDoc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+      const userSecrets = userSecretsDoc ? (userSecretsDoc as Record<string, unknown>) : undefined;
+      const result = await this.candidateProfileExecutor.execute(processedInputs, { userSecrets });
+      if (!result.success) {
+        throw new BadRequestException(result.error ?? 'Candidate Profile Analyzer failed');
+      }
+      const out = {
+        ...(typeof workflowInput === 'object' && workflowInput ? workflowInput : {}),
+        result: result.data ?? {},
+      };
+      if (variableName) outputMap[variableName] = out;
+      return outputMap;
+    }
+
+    if (fn === 'processRequestTrigger') {
+      const requestBody = (workflowInput as Record<string, unknown>)?.trigger ?? (workflowInput as Record<string, unknown>)?.requestBody ?? workflowInput;
+      if (variableName) outputMap[variableName] = requestBody;
+      return outputMap;
+    }
 
     if (fn === 'processInput') {
       if (Array.isArray(subNodes) && subNodes.length > 0) {
@@ -1419,6 +1969,184 @@ export class ActionService {
     if (fn === 'processOutput') {
       const value = params?.value ?? workflowInput?.[variableName as string];
       if (variableName) outputMap[variableName] = value;
+      return outputMap;
+    }
+
+    if (fn === 'parseText') {
+      const text = (params?.text ?? params?.Text ?? '') as string;
+      const result = await this.parseText({
+        text: typeof text === 'string' ? text : String(text ?? ''),
+        trimSpaces: (params?.trimSpaces ?? params?.removeExtraSpace) as boolean | undefined,
+        removeNumbers: (params?.removeNumbers ?? params?.remove_numbers) as boolean | undefined,
+        convertToTitleCase: (params?.convertToTitleCase ?? params?.convert_to_title_case) as boolean | undefined,
+        specialCharactersToRemove: (params?.specialCharactersToRemove ?? params?.special_characters_to_remove) as string[] | undefined,
+        removeAllSpecialCharsKeepSpace: (params?.removeAllSpecialCharsKeepSpace ?? params?.remove_all_special_chars_keep_space) as boolean | undefined,
+        extractArray: (params?.extractArray ?? params?.extract_array) as boolean | undefined,
+        extractJSON: (params?.extractJSON ?? params?.extract_json) as boolean | undefined,
+      });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'registerWebhookForCalendly') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      const eventTypes = (params?.eventTypes ?? params?.event_types ?? workflowInput?.eventTypes ?? workflowInput?.event_types) as string | string[];
+      const workflowURL = (params?.workflowURL ?? params?.workflow_url ?? workflowInput?.workflowURL ?? workflowInput?.workflow_url) as string;
+      const result = await this.registerWebhookForCalendly({ userId, eventTypes, workflowURL });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'createCalWebhook') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      const triggerUrl = (params?.triggerUrl ?? params?.trigger_url ?? workflowInput?.triggerUrl ?? workflowInput?.trigger_url) as string;
+      const triggerEvents = (params?.triggerEvents ?? params?.trigger_events ?? params?.triggers ?? workflowInput?.triggerEvents ?? workflowInput?.trigger_events) as string | string[];
+      if (!userId) throw new BadRequestException('userId is required for createCalWebhook');
+      if (!triggerUrl?.trim()) throw new BadRequestException('triggerUrl (subscriber URL) is required for createCalWebhook');
+      const triggers = Array.isArray(triggerEvents) ? triggerEvents : triggerEvents != null ? [String(triggerEvents)] : [];
+      const result = await this.calService.createWebhook(userId, {
+        subscriberUrl: triggerUrl.trim(),
+        triggers,
+      });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'searchHubspotRecords') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      const resolved = deepResolveValue({ ...params }, { ...workflowInput, ...params }) as Record<string, any>;
+      const recordType = (resolved?.recordType ?? 'contacts') as string;
+      const query = (resolved?.query ?? '') as string;
+      if (!userId) throw new BadRequestException('userId is required for searchHubspotRecords');
+      const result = await this.hubspotService.searchRecords(userId, recordType, { query });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'updateHubspotRecordContact') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      const resolved = deepResolveValue({ ...params }, { ...workflowInput, ...params }) as Record<string, any>;
+      const recordId = (resolved?.recordId ?? resolved?.record_id ?? '') as string;
+      if (!userId) throw new BadRequestException('userId is required for updateHubspotRecordContact');
+      if (!recordId) throw new BadRequestException('recordId is required for updateHubspotRecordContact');
+      const additionalFields = resolved?.additionalFields ?? {};
+      const result = await this.hubspotService.updateContact(userId, recordId, {
+        properties: {
+          email: resolved?.email,
+          firstname: resolved?.firstName ?? resolved?.firstname,
+          lastname: resolved?.lastName ?? resolved?.lastname,
+          jobtitle: resolved?.jobTitle ?? resolved?.jobtitle,
+          company: resolved?.companyName ?? resolved?.company,
+          hubspot_owner_id: resolved?.contactOwner,
+          lifecyclestage: resolved?.lifeCycleStage ?? resolved?.lifecyclestage,
+          hs_lead_status: resolved?.leadStatus ?? resolved?.hs_lead_status,
+          additionalFields: typeof additionalFields === 'object' ? additionalFields : {},
+        },
+      });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'createHubspotRecordContact') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      const resolved = deepResolveValue({ ...params }, { ...workflowInput, ...params }) as Record<string, any>;
+      if (!userId) throw new BadRequestException('userId is required for createHubspotRecordContact');
+      const additionalFields = resolved?.additionalFields ?? {};
+      const result = await this.hubspotService.createContact(userId, {
+        properties: {
+          email: resolved?.email,
+          firstname: resolved?.firstName ?? resolved?.firstname,
+          lastname: resolved?.lastName ?? resolved?.lastname,
+          jobtitle: resolved?.jobTitle ?? resolved?.jobtitle,
+          company: resolved?.companyName ?? resolved?.company,
+          hubspot_owner_id: resolved?.contactOwner,
+          lifecyclestage: resolved?.lifeCycleStage ?? resolved?.lifecyclestage,
+          hs_lead_status: resolved?.leadStatus ?? resolved?.hs_lead_status,
+          additionalFields: typeof additionalFields === 'object' ? additionalFields : {},
+        },
+      });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'appendColumnToSheet') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      let spreadsheetUrl = (params?.spreadsheetUrl ?? params?.spreadsheet_url ?? workflowInput?.spreadsheetUrl ?? workflowInput?.spreadsheet_url) as string | undefined;
+      if (!spreadsheetUrl?.trim()) {
+        spreadsheetUrl = this.getSpreadsheetUrlFromInput(workflowInput);
+      }
+      if (!spreadsheetUrl?.trim()) {
+        throw new BadRequestException(
+          'Spreadsheet URL is required. Pass spreadsheetUrl in node params or ensure the form (or a previous node) provides a Google Sheets URL (e.g. "Candidate Sheet", "Campaign Sheet").',
+        );
+      }
+      const sheetData = (params?.sheetData ?? params?.sheet_data ?? workflowInput?.sheetData ?? workflowInput?.sheet_data) as { sheetId: number; sheetTitle: string } | undefined;
+      let newValues = (params?.newValues ?? params?.new_values ?? workflowInput?.newValues ?? workflowInput?.new_values) as { columnName: string; values?: any[] }[] | undefined;
+      // Resolve ${...} placeholders in newValues (e.g. ${loop.candidate_profile_analyzer.result.atsResult.isMatch}) from workflow variables
+      if (Array.isArray(newValues) && workflowInput && typeof workflowInput === 'object') {
+        newValues = deepResolveValue(newValues, workflowInput) as { columnName: string; values?: any[] }[];
+      }
+      const result = await this.gsheetsService.appendColumnToSheet({ spreadsheetUrl, sheetData, newValues, userId });
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'createInstantlyWebhook') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      let triggerUrl = (params?.triggerUrl ?? params?.trigger_url ?? params?.target_hook_url ?? workflowInput?.triggerUrl ?? workflowInput?.trigger_url) as string | undefined;
+      const webhookName = (params?.webhookName ?? params?.webhook_name ?? params?.name ?? workflowInput?.webhookName ?? workflowInput?.webhook_name) as string;
+      const campaign = (params?.campaign ?? workflowInput?.campaign) as string | undefined;
+      const events = (params?.events ?? params?.event_type ?? params?.eventType ?? workflowInput?.events ?? workflowInput?.event_type) as string | undefined;
+      // Build trigger URL from execution context when not provided (e.g. template leaves it blank for "this workflow's callback")
+      if ((!triggerUrl || String(triggerUrl).trim() === '') && _context?.workflowId && _context?.nodeId && userId) {
+        const baseUrl = (this.configService.get<string>('BASE_URL') ?? this.configService.get<string>('CONNECT_BASE_URL') ?? 'http://localhost:8000').replace(/\/+$/, '');
+        triggerUrl = `${baseUrl}/orchestration/workflow/instantly/trigger-webhook?workflowId=${_context.workflowId}&nodeId=${_context.nodeId}&userId=${userId}`;
+      }
+      const name = webhookName != null && String(webhookName).trim() !== '' ? String(webhookName).trim() : 'Workflow Webhook';
+      const target_hook_url = triggerUrl != null ? String(triggerUrl).trim() : '';
+      const event_type = events != null ? String(events).trim() : '';
+      if (!target_hook_url || !event_type) {
+        const missing: string[] = [];
+        if (!target_hook_url) missing.push('triggerUrl (or set BASE_URL/CONNECT_BASE_URL so it can be built from workflowId/nodeId/userId)');
+        if (!event_type) missing.push('event_type / events (e.g. "lead.added" — set in the node config)');
+        throw new BadRequestException(
+          `createInstantlyWebhook missing required fields: ${missing.join('; ')}.`,
+        );
+      }
+      const payload = {
+        name,
+        target_hook_url,
+        event_type,
+        ...(campaign != null && String(campaign).trim() !== '' ? { campaign: String(campaign).trim() } : {}),
+      };
+      const result = await this.instantlyService.createWebhook(userId, payload);
+      if (variableName) outputMap[variableName] = result;
+      return outputMap;
+    }
+
+    if (fn === 'send_reply_to_email' || fn === 'replyToInstantlyEmail') {
+      const userId = (params?.userId ?? params?.user_id ?? workflowInput?.userId ?? workflowInput?.user_id) as string;
+      const emailId = (params?.emailId ?? params?.email_id ?? params?.reply_to_uuid) as string;
+      const eaccount = (params?.eaccount ?? params?.email_account) as string;
+      const subject = (params?.subject ?? '') as string;
+      const html = (params?.html ?? '') as string;
+      const text = (params?.text ?? '') as string;
+      const ccEmail = params?.ccEmail ?? params?.cc_email as string | string[] | undefined;
+      const bccEmail = params?.bccEmail ?? params?.bcc_email as string | string[] | undefined;
+      if (!userId) throw new BadRequestException('userId is required for send_reply_to_email / replyToInstantlyEmail');
+      if (!emailId) throw new BadRequestException('Email ID (emailId) is required for send_reply_to_email / replyToInstantlyEmail');
+      if (!eaccount) throw new BadRequestException('Sender account (eaccount) is required for send_reply_to_email / replyToInstantlyEmail');
+      if (!subject) throw new BadRequestException('Subject is required for send_reply_to_email / replyToInstantlyEmail');
+      if (!text && !html) throw new BadRequestException('Either text or HTML is required for send_reply_to_email / replyToInstantlyEmail');
+      const result = await this.instantlyService.replyToInstantlyEmail(userId, {
+        reply_to_uuid: emailId,
+        eaccount,
+        subject,
+        body: { text: text || undefined, html: html || undefined },
+        ...(ccEmail != null && (typeof ccEmail === 'string' || Array.isArray(ccEmail)) ? { cc_address_email_list: ccEmail } : {}),
+        ...(bccEmail != null && (typeof bccEmail === 'string' || Array.isArray(bccEmail)) ? { bcc_address_email_list: bccEmail } : {}),
+      });
+      if (variableName) outputMap[variableName] = result;
       return outputMap;
     }
 
