@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { ensureRedisNoEviction } from './config/redis.config';
 
 // Polyfill for Node < 22: pdfjs-dist and other deps may use Promise.withResolvers
 if (typeof (Promise as any).withResolvers === 'undefined') {
@@ -15,6 +16,7 @@ if (typeof (Promise as any).withResolvers === 'undefined') {
 }
 
 async function bootstrap() {
+  await ensureRedisNoEviction(process.env);
   const app = await NestFactory.create(AppModule);
   app.enableCors({
     origin: [
