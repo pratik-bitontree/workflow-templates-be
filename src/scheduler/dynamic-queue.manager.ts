@@ -1,28 +1,19 @@
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { Queue, Worker } from 'bullmq';
+import { getRedisConnectionOptions } from '../config/redis.config';
 import { RunWorkflowService } from './run-workflow.service';
 import { NodeCompletionProcessor } from './node-completion.processor';
-
-const getRedisConnection = (config: ConfigService) => ({
-  host: config.get('REDIS_HOST', 'localhost'),
-  port: config.get('REDIS_PORT', 6379),
-  password: config.get('REDIS_PASSWORD') || undefined,
-  db: config.get('REDIS_DB', 0),
-  maxRetriesPerRequest: null,
-});
 
 @Injectable()
 export class DynamicQueueManager {
   private readonly queues = new Map<string, { queue: Queue; worker: Worker }>();
-  private readonly connectionOptions: ReturnType<typeof getRedisConnection>;
+  private readonly connectionOptions: ReturnType<typeof getRedisConnectionOptions>;
 
   constructor(
-    private readonly config: ConfigService,
     @Inject(forwardRef(() => RunWorkflowService)) private readonly runWorkflow: RunWorkflowService,
     @Inject(forwardRef(() => NodeCompletionProcessor)) private readonly nodeCompletion: NodeCompletionProcessor,
   ) {
-    this.connectionOptions = getRedisConnection(config);
+    this.connectionOptions = getRedisConnectionOptions(process.env);
   }
 
   async createQueueForExecution(workflowExecutionId: string) {
