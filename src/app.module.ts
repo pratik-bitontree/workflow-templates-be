@@ -9,10 +9,22 @@ import { SchedulerModule } from './scheduler/scheduler.module';
 import { WorkerModule } from './worker/worker.module';
 import { IntegrationHubModule } from './integration-hub/integration-hub.module';
 
+const mongodbUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/templates-workflow';
+
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    MongooseModule.forRoot(process.env.MONGODB_URI || 'mongodb://localhost:27017/templates-workflow'),
+    MongooseModule.forRoot(mongodbUri, {
+      connectionFactory: (connection) => {
+        connection.on('error', (err: Error) => {
+          console.error('[MongoDB] connection error:', err.message || err);
+        });
+        connection.on('close', () => {
+          console.warn('[MongoDB] connection closed');
+        });
+        return connection;
+      },
+    }),
     BullModule.forRoot({
       connection: getRedisConnectionOptions(),
     }),

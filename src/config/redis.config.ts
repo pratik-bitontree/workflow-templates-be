@@ -19,6 +19,11 @@ export function getRedisConnectionOptions(env: NodeJS.ProcessEnv = process.env):
     try {
       const u = new URL(url);
       const useTls = u.protocol === 'rediss:';
+      if (!useTls && (u.hostname.includes('upstash.io') || u.hostname.includes('render.com'))) {
+        console.warn(
+          '[Redis] REDIS_URL uses redis:// but Upstash/Render require TLS. Use rediss:// to avoid ECONNRESET.',
+        );
+      }
       const opts: RedisConnectionOptions = {
         host: u.hostname,
         port: parseInt(u.port || '6379', 10),
