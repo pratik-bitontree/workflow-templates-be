@@ -19,10 +19,7 @@ async function bootstrap() {
   await ensureRedisNoEviction(process.env);
   const app = await NestFactory.create(AppModule);
   app.enableCors({
-    origin: [
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-    ],
+    origin: process.env.NODE_ENV === 'production' ? true : ['http://localhost:3000', 'http://127.0.0.1:3000'],
     credentials: true,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -30,9 +27,9 @@ async function bootstrap() {
   app.setGlobalPrefix('api', {
     exclude: ['orchestration/(.*)'],
   });
-  const port = process.env.PORT || 8000;
-  await app.listen(port);
-  console.log(`Templates Workflow BE (monolithic) running on port ${port}`);
+  const port = parseInt(process.env.PORT || '8000', 10);
+  await app.listen(port, '0.0.0.0');
+  console.log(`Templates Workflow BE (monolithic) running on http://0.0.0.0:${port}`);
 }
 bootstrap().catch((err) => {
   console.error(err);
