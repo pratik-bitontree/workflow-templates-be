@@ -17,6 +17,10 @@ import { HubspotService } from './services/hubspot/hubspot.service';
 import { ApiKeyManager } from './rate-limitting/api-key-manager.service';
 import { RateLimiter } from './rate-limitting/rate-limiter.service';
 import { CandidateProfileExecutor } from './agent-executor/candidate-profile.executor';
+import { RedditSearchExecutor } from './agent-executor/reddit-search.executor';
+import { SeoKeywordsExecutor } from './agent-executor/seo-keywords.executor';
+import { ImageSanitizationExecutor } from './agent-executor/image-sanitization.executor';
+import { CarouselPdfExecutor } from './agent-executor/carousel-pdf.executor';
 
 @Module({
   imports: [
@@ -44,6 +48,10 @@ import { CandidateProfileExecutor } from './agent-executor/candidate-profile.exe
     ZohoService,
     HubspotService,
     CandidateProfileExecutor,
+    RedditSearchExecutor,
+    SeoKeywordsExecutor,
+    ImageSanitizationExecutor,
+    CarouselPdfExecutor,
   ],
 })
 export class WorkerModule {}

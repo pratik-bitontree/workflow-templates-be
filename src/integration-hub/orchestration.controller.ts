@@ -3,6 +3,7 @@ import { Response } from 'express';
 import { createHash, randomBytes } from 'crypto';
 import { IntegrationHubService } from './integration-hub.service';
 import { WorkflowService } from '../workflow/workflow.service';
+import { RunWorkflowService } from '../scheduler/run-workflow.service';
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -15,7 +16,16 @@ const AIRTABLE_SCOPES = 'data.records:read data.records:write schema.bases:read 
 /** PKCE code_verifier (and redirect_uri used) per state; cleaned after use or TTL. */
 const airtablePkceStore = new Map<string, { code_verifier: string; redirect_uri: string }>();
 const calendlyPkceStore = new Map<string, string>(); // state -> code_verifier
+const twitterPkceStore = new Map<string, string>(); // state -> code_verifier
+const linkedinPkceStore = new Map<string, string>(); // state -> code_verifier
 const PKCE_TTL_MS = 10 * 60 * 1000;
+
+const TWITTER_SCOPE = 'tweet.read users.read offline.access tweet.write';
+const LINKEDIN_SCOPE = [
+  'openid', 'profile', 'email', 'w_member_social', 'r_basicprofile',
+  'rw_ads', 'r_ads', 'r_ads_reporting', 'rw_organization_admin', 'w_organization_social', 'r_organization_social',
+].join(' ');
+const WORDPRESS_SCOPE = 'auth sites posts users';
 
 const CALENDLY_AUTH_URL = 'https://auth.calendly.com/oauth';
 
@@ -66,6 +76,32 @@ interface HubSpotTokenInfo {
   user?: string;
 }
 
+interface TwitterMeData {
+  id?: string;
+  name?: string;
+  username?: string;
+  profile_image_url?: string;
+  description?: string;
+}
+
+interface TwitterMeResponse {
+  data?: TwitterMeData;
+  id?: string;
+  name?: string;
+  username?: string;
+}
+
+interface LinkedInMeResponse {
+  id?: string;
+  localizedFirstName?: string;
+  localizedLastName?: string;
+}
+
+interface WordPressMeResponse {
+  email?: string;
+  display_name?: string;
+}
+
 interface CalendlyUserResource {
   uri?: string;
   name?: string;
@@ -94,7 +130,19 @@ export class OrchestrationController {
   constructor(
     private readonly integrationHub: IntegrationHubService,
     private readonly workflowService: WorkflowService,
+    private readonly runWorkflowService: RunWorkflowService,
   ) {}
+
+  /**
+   * Agent webhook: called by external AI-Agent service when an agent run completes.
+   * Payload: { data: { extras: { nodeExecutionId, workflowExecutionId }, agentRunData: { result, status: 'COMPLETED'|'FAILED' } } }
+   * Enqueues node completion so the workflow continues.
+   */
+  @Post('workflow/agent')
+  async agentWebhook(@Body() body: any) {
+    const result = await this.runWorkflowService.processAgentWebhook(body);
+    return result;
+  }
 
   /**
    * Instantly (and other) webhook trigger: POST /orchestration/workflow/instantly/trigger-webhook?workflowId=...&nodeId=...&userId=...
@@ -153,6 +201,30 @@ export class OrchestrationController {
     }
     const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
     return `${baseUrl}/orchestration/zoho/callback`;
+  }
+
+  /** Twitter (X) OAuth 2.0 redirect URI; register this in developer.twitter.com. */
+  private getTwitterRedirectUri(): string {
+    const explicit = (process.env.TWITTER_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    if (explicit && (explicit.startsWith('http://') || explicit.startsWith('https://'))) return explicit;
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+    return `${baseUrl}/orchestration/twitter/callback`;
+  }
+
+  /** LinkedIn OAuth 2.0 redirect URI; register this in LinkedIn Developer Portal. */
+  private getLinkedInRedirectUri(): string {
+    const explicit = (process.env.LINKEDIN_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    if (explicit && (explicit.startsWith('http://') || explicit.startsWith('https://'))) return explicit;
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+    return `${baseUrl}/orchestration/linkedin/callback`;
+  }
+
+  /** WordPress.com OAuth redirect URI; register this in WordPress.com Application Passwords / OAuth. */
+  private getWordPressRedirectUri(): string {
+    const explicit = (process.env.WORDPRESS_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    if (explicit && (explicit.startsWith('http://') || explicit.startsWith('https://'))) return explicit;
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+    return `${baseUrl}/orchestration/wordpress/callback`;
   }
 
   /** Zoho region-specific auth and CRM base URLs (in, com, eu). */
@@ -328,6 +400,78 @@ export class OrchestrationController {
       res.redirect(302, url);
       return;
     }
+    if (service === 'twitter') {
+      const uid = (userId || state?.split('|')[0] || '').trim() || '000000000000000000000001';
+      const clientId = (process.env.TWITTER_CLIENT_ID || '').trim();
+      const redirectUri = this.getTwitterRedirectUri();
+      const authBase = (process.env.TWITTER_OAUTH_URL || 'https://twitter.com/i/oauth2').replace(/\/+$/, '');
+      if (!clientId) {
+        res.status(500).send('<p>Twitter (X) OAuth not configured. Set TWITTER_CLIENT_ID in backend .env.</p>');
+        return;
+      }
+      const codeVerifier = randomBytes(32).toString('hex');
+      const codeChallenge = createHash('sha256').update(codeVerifier, 'utf8').digest('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const stateParam = Buffer.from(JSON.stringify({ userId: uid, codeVerifier })).toString('base64');
+      twitterPkceStore.set(stateParam, codeVerifier);
+      setTimeout(() => twitterPkceStore.delete(stateParam), PKCE_TTL_MS);
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        scope: TWITTER_SCOPE,
+        state: stateParam,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+      });
+      res.redirect(302, `${authBase}/authorize?${params.toString()}`);
+      return;
+    }
+    if (service === 'linkedin') {
+      const uid = (userId || state?.split('|')[0] || '').trim() || '000000000000000000000001';
+      const clientId = (process.env.LINKEDIN_CLIENT_ID || '').trim();
+      const redirectUri = this.getLinkedInRedirectUri();
+      const authBase = (process.env.LINKEDIN_AUTH_URL || 'https://www.linkedin.com/oauth').replace(/\/+$/, '');
+      if (!clientId) {
+        res.status(500).send('<p>LinkedIn OAuth not configured. Set LINKEDIN_CLIENT_ID in backend .env.</p>');
+        return;
+      }
+      const codeVerifier = randomBytes(32).toString('hex');
+      const codeChallenge = createHash('sha256').update(codeVerifier, 'utf8').digest('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const stateParam = Buffer.from(JSON.stringify({ userId: uid, codeVerifier })).toString('base64');
+      linkedinPkceStore.set(stateParam, codeVerifier);
+      setTimeout(() => linkedinPkceStore.delete(stateParam), PKCE_TTL_MS);
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        scope: LINKEDIN_SCOPE,
+        state: stateParam,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+      });
+      res.redirect(302, `${authBase}/v2/authorization?${params.toString()}`);
+      return;
+    }
+    if (service === 'wordpress') {
+      const uid = (userId || state?.split('|')[0] || '').trim() || '000000000000000000000001';
+      const clientId = (process.env.WORDPRESS_CLIENT_ID || '').trim();
+      const redirectUri = this.getWordPressRedirectUri();
+      const authUrl = (process.env.WORDPRESS_AUTH_URL || 'https://public-api.wordpress.com/oauth2/authorize').replace(/\/+$/, '');
+      if (!clientId) {
+        res.status(500).send('<p>WordPress OAuth not configured. Set WORDPRESS_CLIENT_ID in backend .env.</p>');
+        return;
+      }
+      const stateParam = Buffer.from(JSON.stringify({ userId: uid })).toString('base64');
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        state: stateParam,
+        scope: WORDPRESS_SCOPE,
+      });
+      res.redirect(302, `${authUrl}?${params.toString()}`);
+      return;
+    }
     const uid = userId || state?.split('|')[0] || '000000000000000000000001';
     const clientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
     // Normalize: no trailing slash — must match Google Cloud Console exactly
@@ -405,9 +549,259 @@ export class OrchestrationController {
     }
   }
 
+  /** Twitter (X) OAuth 2.0 callback: exchange code for token and save. */
+  @Get('twitter/callback')
+  async twitterCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('error') error: string,
+    @Res() res: Response,
+  ) {
+    if (error) {
+      res.send(this.closePopupHtml(`Twitter OAuth error: ${error}`));
+      return;
+    }
+    if (!code || !state) {
+      res.send(this.closePopupHtml('Missing code or state. Try connecting again.'));
+      return;
+    }
+    let userId: string;
+    let codeVerifier: string;
+    try {
+      const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+      userId = (decoded?.userId || '').trim() || '000000000000000000000001';
+      codeVerifier = twitterPkceStore.get(state) || decoded?.codeVerifier;
+    } catch {
+      res.send(this.closePopupHtml('Invalid state. Try connecting again.'));
+      return;
+    }
+    twitterPkceStore.delete(state);
+    const clientId = (process.env.TWITTER_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.TWITTER_CLIENT_SECRET || '').trim();
+    const redirectUri = this.getTwitterRedirectUri();
+    const apiUrl = (process.env.TWITTER_API_URL || 'https://api.twitter.com').replace(/\/+$/, '');
+    if (!clientId || !clientSecret) {
+      res.send(this.closePopupHtml('Twitter OAuth not configured. Set TWITTER_CLIENT_ID and TWITTER_CLIENT_SECRET in .env'));
+      return;
+    }
+    try {
+      const tokenRes = await fetch(`${apiUrl}/oauth2/token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
+        },
+        body: new URLSearchParams({
+          code,
+          grant_type: 'authorization_code',
+          redirect_uri: redirectUri,
+          code_verifier: codeVerifier,
+        }),
+      });
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
+      if (tokens.error || !tokens.access_token) {
+        res.send(this.closePopupHtml(`Twitter token error: ${tokens.error_description || tokens.error || 'Unknown'}`));
+        return;
+      }
+      const accessToken = tokens.access_token as string;
+      const refreshToken = (tokens.refresh_token as string) || '';
+      const userRes = await fetch(`${apiUrl}/2/users/me?user.fields=id,name,username,profile_image_url,description`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const userJson = (await userRes.json()) as TwitterMeResponse;
+      const userData = userJson?.data || userJson;
+      const existingIds = await this.integrationHub.getOAuthAccountMetaIds(userId, 'twitter');
+      if (userData?.id && existingIds.includes(userData.id)) {
+        res.send(this.closePopupHtml('This Twitter account is already connected.'));
+        return;
+      }
+      const refreshExpireAt = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000); // 180 days
+      const accountId = await this.integrationHub.saveTwitterOAuthAccount(userId, {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user_name: userData?.name ?? undefined,
+        meta: userData?.id ? { user_id: userData.id } : undefined,
+        refresh_token_expire_at: refreshExpireAt,
+      });
+      res.send(this.closePopupHtml(null, accountId));
+    } catch (e: any) {
+      res.send(this.closePopupHtml(e?.message || 'Failed to complete Twitter sign-in.'));
+    }
+  }
+
+  /** LinkedIn OAuth 2.0 callback: exchange code for token and save. */
+  @Get('linkedin/callback')
+  async linkedinCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('error') error: string,
+    @Res() res: Response,
+  ) {
+    if (error) {
+      res.send(this.closePopupHtml(`LinkedIn OAuth error: ${error}`));
+      return;
+    }
+    if (!code || !state) {
+      res.send(this.closePopupHtml('Missing code or state. Try connecting again.'));
+      return;
+    }
+    let userId: string;
+    let codeVerifier: string | undefined;
+    try {
+      const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+      userId = (decoded?.userId || '').trim() || '000000000000000000000001';
+      codeVerifier = linkedinPkceStore.get(state) || decoded?.codeVerifier;
+    } catch {
+      res.send(this.closePopupHtml('Invalid state. Try connecting again.'));
+      return;
+    }
+    linkedinPkceStore.delete(state);
+    const clientId = (process.env.LINKEDIN_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.LINKEDIN_CLIENT_SECRET || '').trim();
+    const redirectUri = this.getLinkedInRedirectUri();
+    const authBase = (process.env.LINKEDIN_AUTH_URL || 'https://www.linkedin.com/oauth').replace(/\/+$/, '');
+    if (!clientId || !clientSecret) {
+      res.send(this.closePopupHtml('LinkedIn OAuth not configured. Set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET in .env'));
+      return;
+    }
+    try {
+      const tokenBody: Record<string, string> = {
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+      };
+      if (codeVerifier) tokenBody.code_verifier = codeVerifier;
+      const tokenRes = await fetch(`${authBase}/v2/accessToken`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(tokenBody),
+      });
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse & { refresh_token_expires_in?: number };
+      if (tokens.error || !tokens.access_token) {
+        res.send(this.closePopupHtml(`LinkedIn token error: ${tokens.error_description || tokens.error || 'Unknown'}`));
+        return;
+      }
+      const accessToken = tokens.access_token as string;
+      const refreshToken = (tokens.refresh_token as string) || '';
+      const userRes = await fetch('https://api.linkedin.com/v2/me', {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'X-Restli-Protocol-Version': '2.0.0',
+        },
+      });
+      const me = (await userRes.json()) as LinkedInMeResponse;
+      const linkedinId = me?.id;
+      const firstName = me?.localizedFirstName ?? '';
+      const lastName = me?.localizedLastName ?? '';
+      const existingIds = await this.integrationHub.getOAuthAccountMetaIds(userId, 'linkedin');
+      if (linkedinId && existingIds.includes(linkedinId)) {
+        res.send(this.closePopupHtml('This LinkedIn account is already connected.'));
+        return;
+      }
+      const refreshExpireAt = tokens.refresh_token_expires_in
+        ? new Date(Date.now() + tokens.refresh_token_expires_in * 1000)
+        : undefined;
+      const accountId = await this.integrationHub.saveLinkedInOAuthAccount(userId, {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user_name: `${firstName} ${lastName}`.trim() || undefined,
+        meta: linkedinId ? { user_id: linkedinId } : undefined,
+        refresh_token_expire_at: refreshExpireAt,
+      });
+      res.send(this.closePopupHtml(null, accountId));
+    } catch (e: any) {
+      res.send(this.closePopupHtml(e?.message || 'Failed to complete LinkedIn sign-in.'));
+    }
+  }
+
+  /** WordPress.com OAuth callback: exchange code for token and save. */
+  @Get('wordpress/callback')
+  async wordpressCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Query('error') error: string,
+    @Res() res: Response,
+  ) {
+    if (error) {
+      res.send(this.closePopupHtml(`WordPress OAuth error: ${error}`));
+      return;
+    }
+    if (!code || !state) {
+      res.send(this.closePopupHtml('Missing code or state. Try connecting again.'));
+      return;
+    }
+    let userId: string;
+    try {
+      const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+      userId = (decoded?.userId || '').trim() || '000000000000000000000001';
+    } catch {
+      res.send(this.closePopupHtml('Invalid state. Try connecting again.'));
+      return;
+    }
+    const clientId = (process.env.WORDPRESS_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.WORDPRESS_CLIENT_SECRET || '').trim();
+    const redirectUri = this.getWordPressRedirectUri();
+    const tokenUrl = (process.env.WORDPRESS_TOKEN_URL || 'https://public-api.wordpress.com/oauth2/token').replace(/\/+$/, '');
+    if (!clientId || !clientSecret) {
+      res.send(this.closePopupHtml('WordPress OAuth not configured. Set WORDPRESS_CLIENT_ID and WORDPRESS_CLIENT_SECRET in .env'));
+      return;
+    }
+    try {
+      const tokenRes = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+          code,
+        }),
+      });
+      const tokens = (await tokenRes.json()) as OAuthTokenResponse;
+      if (tokens.error || !tokens.access_token) {
+        res.send(this.closePopupHtml(`WordPress token error: ${tokens.error_description || tokens.error || 'Unknown'}`));
+        return;
+      }
+      const accessToken = tokens.access_token as string;
+      const refreshToken = (tokens.refresh_token as string) || '';
+      const userRes = await fetch('https://public-api.wordpress.com/rest/v1.1/me', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const wpUser = (await userRes.json()) as WordPressMeResponse;
+      const email = wpUser?.email ?? '';
+      const displayName = wpUser?.display_name ?? '';
+      const existing = await this.integrationHub.getConnectedAccounts(userId, 'wordpress');
+      const existingEmails = (existing as any[]).map((a: any) => a.email).filter(Boolean);
+      if (email && existingEmails.includes(email)) {
+        res.send(this.closePopupHtml('This WordPress account is already connected.'));
+        return;
+      }
+      const accountId = await this.integrationHub.saveWordPressOAuthAccount(userId, {
+        access_token: accessToken,
+        refresh_token: refreshToken || undefined,
+        email: email || undefined,
+        user_name: displayName || email || undefined,
+      });
+      res.send(this.closePopupHtml(null, accountId));
+    } catch (e: any) {
+      res.send(this.closePopupHtml(e?.message || 'Failed to complete WordPress sign-in.'));
+    }
+  }
+
   private getHubSpotRedirectUri(): string {
-    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
-    return (process.env.HUBSPOT_REDIRECT_URI || '').trim() || `${baseUrl}/orchestration/hubspot/auth/callback`;
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').trim().replace(/\/+$/, '');
+    const fromEnv = (process.env.HUBSPOT_REDIRECT_URI || '').trim();
+    if (fromEnv) {
+      // Expand ${BASE_URL} / ${CONNECT_BASE_URL} so .env can use HUBSPOT_REDIRECT_URI=${BASE_URL}/orchestration/hubspot/auth/callback
+      const expanded = fromEnv
+        .replace(/\$\{BASE_URL\}/g, baseUrl)
+        .replace(/\$\{CONNECT_BASE_URL\}/g, baseUrl);
+      return expanded.replace(/\/+$/, '');
+    }
+    return `${baseUrl}/orchestration/hubspot/callback`;
   }
 
   /** HubSpot OAuth: return auth URL for frontend to open in popup (GET /orchestration/hubspot/auth/login). */

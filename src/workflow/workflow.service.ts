@@ -11,6 +11,13 @@ import { NodeMaster, NodeMasterDocument } from '../schemas/node-master.schema';
 
 export const SCHEDULER_QUEUE_NAME = 'scheduler-queue';
 
+/** Node types that use webhook trigger URL (Calendly, Cal.com, Instantly). */
+const WEBHOOK_TRIGGER_TYPES = new Set(['calendly', 'cal', 'instantly']);
+
+function isWebhookTriggerType(type: string | undefined): boolean {
+  return type != null && WEBHOOK_TRIGGER_TYPES.has((type || '').toLowerCase());
+}
+
 @Injectable()
 export class WorkflowService {
   constructor(
@@ -34,13 +41,84 @@ export class WorkflowService {
     return workflows;
   }
 
-  async getWorkflow(id: string) {
+  /** Backend base URL for webhook trigger links (Calendly, Cal.com, Instantly). */
+  private getBackendBaseUrl(): string {
+    const url = (
+      process.env.BACKEND_BASE_URL ||
+      process.env.CONNECT_BASE_URL ||
+      process.env.BASE_URL ||
+      'http://localhost:8000'
+    ).trim().replace(/\/+$/, '');
+    return url;
+  }
+
+  /** Build webhook trigger URL for trigger nodes. Format: {baseUrl}/orchestration/workflow/{node}/trigger-webhook?workflowId=...&nodeId=...&userId=... */
+  getTriggerWebhookUrl(nodeType: string, workflowId: string, nodeId: string, userId: string): string {
+    const base = this.getBackendBaseUrl();
+    const node = (nodeType || '').toLowerCase();
+    const normalized = node === 'cal.com' ? 'cal' : node;
+    if (!WEBHOOK_TRIGGER_TYPES.has(normalized)) {
+      return '';
+    }
+    const params = new URLSearchParams({
+      workflowId: String(workflowId),
+      nodeId: String(nodeId),
+      userId: String(userId),
+    });
+    return `${base}/orchestration/workflow/${normalized}/trigger-webhook?${params.toString()}`;
+  }
+
+  async getWorkflow(id: string, userId?: string): Promise<Record<string, unknown>> {
     const workflow = await this.workflowModel
       .findById(id)
       .populate({ path: 'nodes', populate: { path: 'nodeMasterId', select: 'type functionToExecute dynamicParams metaData' } })
       .lean();
     if (!workflow) throw new NotFoundException('Workflow not found');
-    return workflow;
+    const wfId = (workflow as any)._id?.toString?.() || id;
+    const rawNodes = (workflow as any).nodes;
+    if (!userId || !Array.isArray(rawNodes)) {
+      return workflow;
+    }
+    // Build default trigger URL for Input parameters (Trigger URL): env base + path + dynamic workflowId, nodeId, userId
+    const triggerNode = rawNodes.find(
+      (n: any) => isWebhookTriggerType(n?.nodeMasterId?.type),
+    );
+    const firstNodeId = rawNodes[0]?._id?.toString?.() || '';
+    const triggerType = triggerNode?.nodeMasterId?.type ?? 'calendly';
+    const triggerNodeId = triggerNode?._id?.toString?.() || firstNodeId;
+    const defaultTriggerUrl =
+      this.getTriggerWebhookUrl(triggerType, wfId, triggerNodeId, userId) ||
+      `${this.getBackendBaseUrl()}/orchestration/workflow/calendly/trigger-webhook?${new URLSearchParams({
+        workflowId: wfId,
+        nodeId: triggerNodeId,
+        userId: String(userId),
+      }).toString()}`;
+
+    const nodes = rawNodes.map((node: any) => {
+      const master = node.nodeMasterId;
+      const type = master?.type;
+      let parameters = node.parameters || {};
+      // Inject url for webhook trigger nodes
+      if (isWebhookTriggerType(type)) {
+        const nodeId = node._id?.toString?.() || '';
+        const url = this.getTriggerWebhookUrl(type, wfId, nodeId, userId);
+        parameters = { ...parameters, url };
+      }
+      // Inject default value for form subNodes with variableName "trigger_url" (webhook registration templates)
+      let subNodes = node.subNodes;
+      if (Array.isArray(subNodes) && subNodes.some((s: any) => (s?.parameters?.variableName || '').toString().trim().toLowerCase() === 'trigger_url')) {
+        subNodes = subNodes.map((sub: any) => {
+          const p = sub?.parameters || {};
+          const vn = (p.variableName || '').toString().trim().toLowerCase();
+          if (vn === 'trigger_url') {
+            return { ...sub, parameters: { ...p, defaultValue: defaultTriggerUrl } };
+          }
+          return sub;
+        });
+      }
+      return { ...node, parameters, ...(subNodes !== node.subNodes ? { subNodes } : {}) };
+    });
+    return { ...workflow, nodes };
   }
 
   async createWorkflowExecutionPayload(
@@ -55,11 +133,26 @@ export class WorkflowService {
       .lean();
     if (!workflow) throw new BadRequestException('Workflow not found');
 
+    const wfIdStr = (workflow as any)._id?.toString?.() || workflowId;
     const nodes = Array.isArray(workflow.nodes) ? (workflow.nodes as any[]) : [];
+    let firstTriggerWebhookUrl: string | undefined;
+    let firstTriggerNodeId: string | undefined;
     const sanitizedNodes = nodes.map((node: any) => {
       const master = node.nodeMasterId;
+      const type = master?.type;
+      let parameters = node.parameters || {};
+      if (isWebhookTriggerType(type)) {
+        const nodeId = node._id?.toString?.() || '';
+        const url = this.getTriggerWebhookUrl(type, wfIdStr, nodeId, userId);
+        parameters = { ...parameters, url };
+        if (firstTriggerWebhookUrl == null) {
+          firstTriggerWebhookUrl = url;
+          firstTriggerNodeId = nodeId;
+        }
+      }
       return {
         ...node,
+        parameters,
         functionToExecute: master?.functionToExecute,
         dynamicParams: master?.dynamicParams || [],
         metaData: master?.metaData || {},
@@ -83,7 +176,7 @@ export class WorkflowService {
     });
 
     return {
-      workflowId: workflow._id?.toString?.() || workflowId,
+      workflowId: wfIdStr,
       userId,
       nodes: sanitizedNodes,
       workflowExecutionId,
@@ -92,6 +185,8 @@ export class WorkflowService {
       startNodeId: startNodeId || undefined,
       previousVariables: {},
       previousInput: [],
+      triggerWebhookUrl: firstTriggerWebhookUrl,
+      triggerNodeId: firstTriggerNodeId,
     };
   }
 

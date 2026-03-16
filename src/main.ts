@@ -27,6 +27,11 @@ async function bootstrap() {
   app.setGlobalPrefix('api', {
     exclude: ['orchestration/(.*)'],
   });
+  // Root health route for Render/load balancers (no /api prefix)
+  const http = app.getHttpAdapter();
+  http.all('/', (_req: any, res: any) => res.sendStatus(200));
+  http.all('/health', (_req: any, res: any) => res.sendStatus(200));
+
   const port = parseInt(process.env.PORT || '8000', 10);
   await app.listen(port, '0.0.0.0');
   console.log(`Templates Workflow BE (monolithic) running on http://0.0.0.0:${port}`);

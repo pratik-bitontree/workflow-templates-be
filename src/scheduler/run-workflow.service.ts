@@ -1,4 +1,4 @@
-import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -21,6 +21,7 @@ export class RunWorkflowService {
     @InjectModel(NodeExecution.name) private nodeExecutionModel: Model<NodeExecutionDocument>,
     private readonly workflowCache: WorkflowCacheService,
     @InjectQueue('workflowQueue') private workflowQueue: Queue,
+    @InjectQueue('nodeCompletionQueue') private nodeCompletionQueue: Queue,
     @Inject(forwardRef(() => DynamicQueueManager)) private readonly dynamicQueueManager: DynamicQueueManager,
   ) {}
 
@@ -853,5 +854,86 @@ export class RunWorkflowService {
       );
       this.dynamicQueueManager.closeQueue(workflowExecutionId);
     }
+  }
+
+  /**
+   * Process agent webhook payload from external AI-Agent service (or monorepo pattern).
+   * Expects body with data.extras.nodeExecutionId, data.extras.workflowExecutionId, data.agentRunData (result, status).
+   * Enqueues a node-completion job so the node is marked completed/failed and cache is updated.
+   */
+  async processAgentWebhook(payload: any): Promise<{ success: boolean; completed?: boolean; error?: string }> {
+    const body = payload?.data || payload || {};
+    const extras = body.extras || {};
+    const nodeExecutionId = extras.nodeExecutionId || body.nodeExecutionId;
+    const workflowExecutionId = extras.workflowExecutionId || body.workflowExecutionId;
+    if (!nodeExecutionId || !workflowExecutionId) {
+      this.logger.warn('Agent webhook missing nodeExecutionId or workflowExecutionId');
+      throw new BadRequestException('nodeExecutionId and workflowExecutionId are required in agent webhook payload');
+    }
+    const agentRunData = body.agentRunData || {};
+    const { result, status } = agentRunData;
+    if (!status) {
+      throw new BadRequestException('status is required in agentRunData');
+    }
+    const nodeExecution = await this.nodeExecutionModel.findById(nodeExecutionId).lean();
+    if (!nodeExecution) {
+      this.logger.warn(`Agent webhook: node execution not found ${nodeExecutionId}`);
+      throw new BadRequestException('Node execution not found');
+    }
+    const execution = await this.workflowExecutionModel.findById(workflowExecutionId).lean();
+    if (!execution) {
+      this.logger.warn(`Agent webhook: workflow execution not found ${workflowExecutionId}`);
+      throw new BadRequestException('Workflow execution not found');
+    }
+    const workflowId = (execution.workflowId as any)?._id?.toString?.() ?? (execution.workflowId as any)?.toString?.() ?? '';
+    const variableName = (nodeExecution.parameters as any)?.variableName || 'result';
+
+    if (status === 'COMPLETED') {
+      if (result === undefined || result === null) {
+        throw new BadRequestException('result is required for COMPLETED status');
+      }
+      const returnvalue: Record<string, unknown> =
+        typeof result === 'object' && result !== null && !Array.isArray(result) && Object.keys(result).length > 0 && variableName in result
+          ? (result as Record<string, unknown>)
+          : { [variableName]: result };
+      await this.nodeCompletionQueue.add(
+        'node-completion',
+        {
+          workflowExecutionId,
+          workflowId,
+          nodeExecutionId,
+          status: 'completed',
+          returnvalue,
+        },
+        { removeOnComplete: true },
+      );
+      this.logger.log(`[processAgentWebhook] enqueued completion for nodeExecutionId=${nodeExecutionId}`);
+      return { success: true, completed: true };
+    }
+    if (status === 'FAILED') {
+      let errorMessage = 'Agent execution failed';
+      if (Array.isArray(result) && result[0]?.variableValue) {
+        const first = result[0].variableValue;
+        errorMessage = typeof first === 'string' ? first : (first?.message ?? errorMessage);
+      } else if (typeof result === 'string' && result.trim()) {
+        errorMessage = result;
+      } else if (result && typeof result === 'object' && typeof (result as any).message === 'string') {
+        errorMessage = (result as any).message;
+      }
+      await this.nodeCompletionQueue.add(
+        'node-completion',
+        {
+          workflowExecutionId,
+          workflowId,
+          nodeExecutionId,
+          status: 'failed',
+          returnvalue: { error: errorMessage },
+        },
+        { removeOnComplete: true },
+      );
+      this.logger.log(`[processAgentWebhook] enqueued failure for nodeExecutionId=${nodeExecutionId}`);
+      return { success: true, completed: true, error: errorMessage };
+    }
+    return { success: true, completed: false };
   }
 }

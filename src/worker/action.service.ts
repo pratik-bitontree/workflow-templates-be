@@ -26,6 +26,17 @@ import {
 } from './workflow-processor.utils';
 import { CandidateProfileExecutor } from './agent-executor/candidate-profile.executor';
 import {
+  REDDIT_SEARCH_NODE_MASTER_ID,
+  SEO_KEYWORDS_NODE_MASTER_ID,
+  IMAGE_SANITIZATION_NODE_MASTER_ID,
+  CAROUSEL_PDF_NODE_MASTER_ID,
+  getAgentIdFromContext,
+} from './agent-executor/agent-registry';
+import { RedditSearchExecutor } from './agent-executor/reddit-search.executor';
+import { SeoKeywordsExecutor } from './agent-executor/seo-keywords.executor';
+import { ImageSanitizationExecutor } from './agent-executor/image-sanitization.executor';
+import { CarouselPdfExecutor } from './agent-executor/carousel-pdf.executor';
+import {
   ZohoService,
   CreateZohoContactDto,
   UpdateZohoContactDto,
@@ -57,6 +68,10 @@ export class ActionService {
     private readonly calService: CalService,
     private readonly rateLimiter: RateLimiter,
     private readonly candidateProfileExecutor: CandidateProfileExecutor,
+    private readonly redditSearchExecutor: RedditSearchExecutor,
+    private readonly seoKeywordsExecutor: SeoKeywordsExecutor,
+    private readonly imageSanitizationExecutor: ImageSanitizationExecutor,
+    private readonly carouselPdfExecutor: CarouselPdfExecutor,
     private readonly zohoService: ZohoService,
     private readonly hubspotService: HubspotService,
     @InjectModel(UserSecrets.name) private userSecretsModel: Model<UserSecretsDocument>,
@@ -1852,9 +1867,44 @@ export class ActionService {
         CandidateProfile: resume ?? params?.CandidateProfile ?? params?.Resume,
       };
       if (!CandidateProfileExecutor.canHandle(processedInputs)) {
-        throw new BadRequestException(
-          'Candidate Profile Analyzer requires Resume (or CandidateProfile) and job_description or company_name. Other agents are not supported for in-process execution.',
+        const agentId = getAgentIdFromContext(_context?.nodeMasterId);
+        if (agentId === REDDIT_SEARCH_NODE_MASTER_ID) {
+          const result = await this.redditSearchExecutor.execute(processedInputs);
+          if (!result.success) throw new BadRequestException(result.error);
+          const out = { ...(typeof workflowInput === 'object' && workflowInput ? workflowInput : {}), result: result.data };
+          if (variableName) outputMap[variableName] = out;
+          return outputMap;
+        }
+        if (agentId === SEO_KEYWORDS_NODE_MASTER_ID) {
+          const result = await this.seoKeywordsExecutor.execute(processedInputs);
+          if (!result.success) throw new BadRequestException(result.error);
+          if (variableName) outputMap[variableName] = result.data;
+          return outputMap;
+        }
+        if (agentId === IMAGE_SANITIZATION_NODE_MASTER_ID) {
+          const result = await this.imageSanitizationExecutor.execute(processedInputs);
+          if (!result.success) throw new BadRequestException(result.error);
+          const url = result.data;
+          if (variableName) outputMap[variableName] = { result: url };
+          return outputMap;
+        }
+        if (agentId === CAROUSEL_PDF_NODE_MASTER_ID) {
+          const result = await this.carouselPdfExecutor.execute(processedInputs);
+          if (!result.success) throw new BadRequestException(result.error);
+          if (variableName) outputMap[variableName] = result.data;
+          return outputMap;
+        }
+        // Document Query and other agents: when nodeMasterId is null or unknown, fall back to processAIChat
+        // so the workflow completes instead of failing (e.g. Document Query agent node).
+        this.logger.warn(
+          `[runAgent] Unknown or missing agent nodeMasterId: ${agentId}. Falling back to processAIChat (e.g. Document Query). ` +
+            'Supported in-process agents: Reddit Search, SEO Keywords, Image Sanitization, Carousel PDF, Candidate Profile.',
         );
+        const chatOut = await this.processAIChat({
+          workflowInput: (typeof workflowInput === 'object' && workflowInput ? workflowInput : {}) as Record<string, unknown>,
+          variableName,
+        });
+        return { ...outputMap, ...chatOut };
       }
       const userSecretsDoc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
       const userSecrets = userSecretsDoc ? (userSecretsDoc as Record<string, unknown>) : undefined;

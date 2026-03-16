@@ -33,8 +33,11 @@ export class WorkflowController {
   }
 
   @Get(':id')
-  async getOne(@Param('id') id: string) {
-    return this.workflowService.getWorkflow(id);
+  async getOne(
+    @Param('id') id: string,
+    @Query('userId') userId?: string,
+  ) {
+    return this.workflowService.getWorkflow(id, userId);
   }
 
   @Post('create-execution')

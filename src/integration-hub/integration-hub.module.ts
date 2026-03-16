@@ -9,10 +9,12 @@ import { UserSecrets, UserSecretsSchema } from '../schemas/user-secrets.schema';
 import { ActivityLog, ActivityLogSchema } from '../schemas/activity-log.schema';
 import { NodeMaster, NodeMasterSchema } from '../schemas/node-master.schema';
 import { WorkflowModule } from '../workflow/workflow.module';
+import { SchedulerModule } from '../scheduler/scheduler.module';
 
 @Module({
   imports: [
     WorkflowModule,
+    SchedulerModule,
     MongooseModule.forFeature([
       { name: UserSecrets.name, schema: UserSecretsSchema },
       { name: ActivityLog.name, schema: ActivityLogSchema },

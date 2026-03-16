@@ -25,6 +25,10 @@ const userSecretKeyMap: Record<string, string> = {
   firecrawl: 'firecrawl',
   airtable: 'airtable',
   perplexity: 'perplexity',
+  twitter: 'twitter',
+  linkedin: 'linkedin',
+  'linkedin-marketing': 'linkedin',
+  wordpress: 'wordpress',
 };
 
 const connectionMethodMap: Record<string, { apiKey: boolean; oauth: boolean }> = {
@@ -43,6 +47,9 @@ const connectionMethodMap: Record<string, { apiKey: boolean; oauth: boolean }> =
   instantly: { apiKey: true, oauth: false },
   airtable: { apiKey: false, oauth: true },
   perplexity: { apiKey: true, oauth: false },
+  twitter: { apiKey: false, oauth: true },
+  linkedin: { apiKey: false, oauth: true },
+  wordpress: { apiKey: false, oauth: true },
 };
 
 @Injectable()
@@ -140,7 +147,17 @@ export class IntegrationHubService {
       isPrimary: a.isPrimary || false,
       api_key: a.api_key ? '••••••••••••' : undefined,
       name: a.user_name || a.email || (a.api_key ? 'API Key' : ''),
+      meta: a.meta,
     }));
+  }
+
+  /** Returns meta.user_id values for OAuth accounts (for duplicate check by external id). */
+  async getOAuthAccountMetaIds(userId: string, service: string): Promise<string[]> {
+    const key = userSecretKeyMap[service?.toLowerCase()] || service;
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = (doc as any)?.[key];
+    if (!Array.isArray(accounts)) return [];
+    return accounts.map((a: any) => a?.meta?.user_id).filter(Boolean);
   }
 
   async setPrimaryAccount(userId: string, service: string, accountId: string) {
@@ -327,6 +344,108 @@ export class IntegrationHubService {
     const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
     const accounts = (doc as any)?.zoho;
     return Array.isArray(accounts) ? accounts : [];
+  }
+
+  async saveTwitterOAuthAccount(
+    userId: string,
+    data: {
+      access_token: string;
+      refresh_token: string;
+      user_name?: string;
+      meta?: { user_id?: string };
+      refresh_token_expire_at?: Date;
+    },
+  ): Promise<string> {
+    const key = 'twitter';
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.[key]) ? [...(doc as any)[key]] : [];
+    const newAccountId = new Types.ObjectId();
+    const newAccount = {
+      accountId: newAccountId,
+      connectionType: 'oauth',
+      email: null,
+      user_name: data.user_name ?? null,
+      isPrimary: accounts.length === 0,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      created_at: new Date(),
+      refresh_token_expire_at: data.refresh_token_expire_at ?? null,
+      meta: data.meta ?? {},
+    };
+    accounts.push(newAccount);
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { [key]: accounts } },
+      { upsert: true },
+    );
+    return newAccountId.toString();
+  }
+
+  async saveLinkedInOAuthAccount(
+    userId: string,
+    data: {
+      access_token: string;
+      refresh_token: string;
+      user_name?: string;
+      meta?: { user_id?: string };
+      refresh_token_expire_at?: Date;
+    },
+  ): Promise<string> {
+    const key = 'linkedin';
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.[key]) ? [...(doc as any)[key]] : [];
+    const newAccountId = new Types.ObjectId();
+    const newAccount = {
+      accountId: newAccountId,
+      connectionType: 'oauth',
+      email: null,
+      user_name: data.user_name ?? null,
+      isPrimary: accounts.length === 0,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      created_at: new Date(),
+      refresh_token_expire_at: data.refresh_token_expire_at ?? null,
+      meta: data.meta ?? {},
+    };
+    accounts.push(newAccount);
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { [key]: accounts } },
+      { upsert: true },
+    );
+    return newAccountId.toString();
+  }
+
+  async saveWordPressOAuthAccount(
+    userId: string,
+    data: {
+      access_token: string;
+      refresh_token?: string;
+      email?: string;
+      user_name?: string;
+    },
+  ): Promise<string> {
+    const key = 'wordpress';
+    const doc = await this.userSecretsModel.findOne({ user_id: new Types.ObjectId(userId) }).lean();
+    const accounts = Array.isArray((doc as any)?.[key]) ? [...(doc as any)[key]] : [];
+    const newAccountId = new Types.ObjectId();
+    const newAccount = {
+      accountId: newAccountId,
+      connectionType: 'oauth',
+      email: data.email ?? null,
+      user_name: data.user_name ?? data.email ?? null,
+      isPrimary: accounts.length === 0,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token ?? null,
+      created_at: new Date(),
+    };
+    accounts.push(newAccount);
+    await this.userSecretsModel.updateOne(
+      { user_id: new Types.ObjectId(userId) },
+      { $set: { [key]: accounts } },
+      { upsert: true },
+    );
+    return newAccountId.toString();
   }
 
   async saveZohoOAuthAccount(
