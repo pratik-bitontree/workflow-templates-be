@@ -193,6 +193,20 @@ export class OrchestrationController {
     return `${baseUrl}/orchestration/calendly/callback`;
   }
 
+  /**
+   * Google OAuth redirect URI. Resolves ${BASE_URL} in GOOGLE_REDIRECT_URI (env files do not expand variables).
+   * Must match Google Cloud Console → Authorized redirect URIs exactly (no trailing slash).
+   */
+  private getGoogleRedirectUri(): string {
+    const baseUrl = (process.env.BASE_URL || process.env.CONNECT_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+    const raw = (process.env.GOOGLE_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    const resolved = raw.replace(/\$\{BASE_URL\}/g, baseUrl);
+    if (resolved && (resolved.startsWith('http://') || resolved.startsWith('https://'))) {
+      return resolved;
+    }
+    return `${baseUrl}/orchestration/google/callback`;
+  }
+
   /** Zoho OAuth redirect URI; must match the value registered in Zoho API Console. */
   private getZohoRedirectUri(): string {
     const explicit = (process.env.ZOHO_REDIRECT_URI || '').trim().replace(/\/+$/, '');
@@ -474,8 +488,8 @@ export class OrchestrationController {
     }
     const uid = userId || state?.split('|')[0] || '000000000000000000000001';
     const clientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
-    // Normalize: no trailing slash — must match Google Cloud Console exactly
-    const redirectUri = (process.env.GOOGLE_REDIRECT_URI || '').trim().replace(/\/+$/, '') || undefined;
+    // Normalize: no trailing slash — must match Google Cloud Console exactly. Resolve ${BASE_URL} (env vars are not expanded in .env).
+    const redirectUri = this.getGoogleRedirectUri();
     if (!clientId || !redirectUri) {
       res.status(500).send(
         '<p>OAuth not configured. Set GOOGLE_CLIENT_ID and GOOGLE_REDIRECT_URI in backend .env. GOOGLE_REDIRECT_URI must be this server, e.g. http://localhost:8000/orchestration/google/callback</p>',
@@ -501,7 +515,7 @@ export class OrchestrationController {
     }
     const clientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
     const clientSecret = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
-    const redirectUri = (process.env.GOOGLE_REDIRECT_URI || '').trim().replace(/\/+$/, '');
+    const redirectUri = this.getGoogleRedirectUri();
     if (!clientId || !clientSecret || !redirectUri) {
       res.send(this.closePopupHtml('Server OAuth config missing.'));
       return;
