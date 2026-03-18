@@ -32,7 +32,7 @@ export interface ExecuteCandidateProfileResult {
   error?: string;
 }
 
-const SUPPORTED_LLM = new Set(['openai', 'anthropic', 'perplexity', 'gemini']);
+const SUPPORTED_LLM = new Set(['openai', 'anthropic', 'perplexity', 'gemini', 'groq']);
 
 @Injectable()
 export class CandidateProfileExecutor {
@@ -77,7 +77,8 @@ export class CandidateProfileExecutor {
         return { success: false, statusCode: 400, error: 'CandidateProfile (or Resume) is required.' };
       }
 
-      const llmProvider = (inputs.llm ?? inputs.LLM ?? 'openai').toLowerCase();
+      // Default to groq for testing; set llm/LLM to openai, anthropic, etc. to override
+const llmProvider = (inputs.llm ?? inputs.LLM ?? 'groq').toLowerCase();
       const model = inputs.model ?? inputs.Model ?? this.getDefaultModel(llmProvider);
       if (!SUPPORTED_LLM.has(llmProvider)) {
         return {
@@ -112,6 +113,14 @@ export class CandidateProfileExecutor {
           data = { atsResult: {}, email: {}, raw: cleaned };
         }
       }
+      // Ensure atsResult and email exist with safe defaults so sheet placeholders never resolve to undefined
+      if (!data || typeof data !== 'object') data = {};
+      data.atsResult = data.atsResult && typeof data.atsResult === 'object' ? data.atsResult : {};
+      data.email = data.email && typeof data.email === 'object' ? data.email : {};
+      if (data.atsResult && typeof data.atsResult.isMatch !== 'boolean') data.atsResult.isMatch = false;
+      if (data.atsResult && data.atsResult.reason == null) data.atsResult.reason = '';
+      if (data.email && data.email.subject == null) data.email.subject = '';
+      if (data.email && data.email.body == null) data.email.body = '';
 
       return {
         success: true,
@@ -138,8 +147,9 @@ export class CandidateProfileExecutor {
       anthropic: 'claude-3-haiku-20240307',
       perplexity: 'sonar',
       gemini: 'gemini-2.5-flash',
+      groq: 'llama-3.1-70b-versatile',
     };
-    return defaults[provider] ?? 'gpt-4o-mini';
+    return defaults[provider] ?? 'llama-3.1-70b-versatile';
   }
 
   private async callLLM(
@@ -235,6 +245,38 @@ export class CandidateProfileExecutor {
         },
       });
       return typeof response.content === 'string' ? response.content : JSON.stringify(response.content ?? '');
+    }
+
+    if (provider === 'groq') {
+      const axios = (await import('axios')).default;
+      const payload: Record<string, unknown> = {
+        model:"openai/gpt-oss-120b",
+        messages: messages as any,
+        max_tokens: 4096,
+        temperature: 0.2,
+      };
+      const data = await this.rateLimiter.execute({
+        provider: 'groq',
+        userSecrets,
+        requestFn: async (apiKey: string) => {
+          const res = await axios.post<{
+            choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+            usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+          }>(
+            'https://api.groq.com/openai/v1/chat/completions',
+            payload,
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${apiKey}`,
+              },
+            }
+          );
+          return res.data;
+        },
+      });
+      const content = data.choices?.[0]?.message?.content ?? '';
+      return typeof content === 'string' ? content : JSON.stringify(content);
     }
 
     throw new Error(`Unsupported LLM provider: ${provider}`);

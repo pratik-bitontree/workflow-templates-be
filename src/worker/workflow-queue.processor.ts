@@ -105,6 +105,12 @@ export class WorkflowQueueProcessor extends WorkerHost {
             ? 'processInput'
             : (fn || 'processInput');
 
+      // nodeMasterId can be lost in Bull serialization; fallback to params.nodeMasterId (scheduler sets both)
+      const resolvedNodeMasterId =
+        nodeMasterId != null && String(nodeMasterId).trim() !== ''
+          ? String(nodeMasterId).trim()
+          : (params?.nodeMasterId != null ? String(params.nodeMasterId).trim() : undefined) || undefined;
+
       returnvalue = await this.actionService.executeWorkflowFunction(
         {
           fn: resolvedFn,
@@ -117,7 +123,7 @@ export class WorkflowQueueProcessor extends WorkerHost {
           workflowExecutionId,
           workflowId,
           nodeId,
-          nodeMasterId,
+          nodeMasterId: resolvedNodeMasterId,
         },
       );
 

@@ -6,6 +6,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { OAuth2Client } from 'google-auth-library';
 import { Types } from 'mongoose';
+import { Node, NodeDocument } from '../schemas/node.schema';
 import { UserSecrets, UserSecretsDocument } from '../schemas/user-secrets.schema';
 import { GmailService } from './services/gmail.service';
 import { GsheetsService } from './services/gsheets.service';
@@ -74,6 +75,7 @@ export class ActionService {
     private readonly carouselPdfExecutor: CarouselPdfExecutor,
     private readonly zohoService: ZohoService,
     private readonly hubspotService: HubspotService,
+    @InjectModel(Node.name) private nodeModel: Model<NodeDocument>,
     @InjectModel(UserSecrets.name) private userSecretsModel: Model<UserSecretsDocument>,
   ) {
     const initialKey = this.configService.get<string>('OPEN_AI_SECRET_KEY_1') ?? this.configService.get<string>('OPEN_AI_SECRET_KEY') ?? '';
@@ -1865,33 +1867,55 @@ export class ActionService {
         company_name: workflowInput?.company_name ?? params?.company_name,
         Resume: resume ?? params?.Resume ?? params?.CandidateProfile,
         CandidateProfile: resume ?? params?.CandidateProfile ?? params?.Resume,
+        // SEO Keywords agent: ensure topic/keywords from form or params are available
+        topic: params?.topic ?? workflowInput?.topic ?? params?.keywords ?? workflowInput?.keywords ?? '',
+        keywords: params?.keywords ?? workflowInput?.keywords ?? params?.topic ?? workflowInput?.topic ?? '',
+        region: params?.region ?? workflowInput?.region ?? 'US',
+        timeRange: params?.timeRange ?? workflowInput?.timeRange ?? '1m',
       };
       if (!CandidateProfileExecutor.canHandle(processedInputs)) {
-        const agentId = getAgentIdFromContext(_context?.nodeMasterId);
+        let agentId =
+          getAgentIdFromContext(_context?.nodeMasterId) ??
+          getAgentIdFromContext(params?.nodeMasterId);
+        if (agentId == null && _context?.nodeId) {
+          try {
+            const nodeDoc = await this.nodeModel
+              .findById(_context.nodeId)
+              .select('nodeMasterId')
+              .lean();
+            agentId = getAgentIdFromContext((nodeDoc as any)?.nodeMasterId) ?? null;
+          } catch (err: any) {
+            this.logger.warn(`[runAgent] Node lookup by nodeId failed: ${err?.message}`);
+          }
+        }
         if (agentId === REDDIT_SEARCH_NODE_MASTER_ID) {
           const result = await this.redditSearchExecutor.execute(processedInputs);
           if (!result.success) throw new BadRequestException(result.error);
           const out = { ...(typeof workflowInput === 'object' && workflowInput ? workflowInput : {}), result: result.data };
-          if (variableName) outputMap[variableName] = out;
+          const key = variableName || 'result';
+          outputMap[key] = out;
           return outputMap;
         }
         if (agentId === SEO_KEYWORDS_NODE_MASTER_ID) {
           const result = await this.seoKeywordsExecutor.execute(processedInputs);
           if (!result.success) throw new BadRequestException(result.error);
-          if (variableName) outputMap[variableName] = result.data;
+          const key = variableName || 'result';
+          outputMap[key] = result.data;
           return outputMap;
         }
         if (agentId === IMAGE_SANITIZATION_NODE_MASTER_ID) {
           const result = await this.imageSanitizationExecutor.execute(processedInputs);
           if (!result.success) throw new BadRequestException(result.error);
           const url = result.data;
-          if (variableName) outputMap[variableName] = { result: url };
+          const key = variableName || 'result';
+          outputMap[key] = { result: url };
           return outputMap;
         }
         if (agentId === CAROUSEL_PDF_NODE_MASTER_ID) {
           const result = await this.carouselPdfExecutor.execute(processedInputs);
           if (!result.success) throw new BadRequestException(result.error);
-          if (variableName) outputMap[variableName] = result.data;
+          const key = variableName || 'result';
+          outputMap[key] = result.data;
           return outputMap;
         }
         // Document Query and other agents: when nodeMasterId is null or unknown, fall back to processAIChat
@@ -1916,7 +1940,8 @@ export class ActionService {
         ...(typeof workflowInput === 'object' && workflowInput ? workflowInput : {}),
         result: result.data ?? {},
       };
-      if (variableName) outputMap[variableName] = out;
+      const key = variableName || 'result';
+      outputMap[key] = out;
       return outputMap;
     }
 
@@ -2134,7 +2159,14 @@ export class ActionService {
       let newValues = (params?.newValues ?? params?.new_values ?? workflowInput?.newValues ?? workflowInput?.new_values) as { columnName: string; values?: any[] }[] | undefined;
       // Resolve ${...} placeholders in newValues (e.g. ${loop.candidate_profile_analyzer.result.atsResult.isMatch}) from workflow variables
       if (Array.isArray(newValues) && workflowInput && typeof workflowInput === 'object') {
-        newValues = deepResolveValue(newValues, workflowInput) as { columnName: string; values?: any[] }[];
+        const resolveContext = { ...workflowInput } as Record<string, unknown>;
+        if (resolveContext.result == null && resolveContext.candidate_profile_analyzer != null && typeof resolveContext.candidate_profile_analyzer === 'object') {
+          const cpa = resolveContext.candidate_profile_analyzer as Record<string, unknown>;
+          if (cpa.result != null && typeof cpa.result === 'object') {
+            resolveContext.result = cpa.result;
+          }
+        }
+        newValues = deepResolveValue(newValues, resolveContext) as { columnName: string; values?: any[] }[];
       }
       const result = await this.gsheetsService.appendColumnToSheet({ spreadsheetUrl, sheetData, newValues, userId });
       if (variableName) outputMap[variableName] = result;
@@ -2239,5 +2271,31 @@ export class ActionService {
 
     this.logger.warn(`[executeWorkflowFunction] Unknown functionToExecute: ${fn}`);
     throw new BadRequestException(`Unknown functionToExecute: ${fn}`);
+  }
+
+  /**
+   * Pauses workflow execution for a specified duration (seconds). Aligned with monorepo tools.service.pauseWorkflow.
+   * Called when functionToExecute === 'pauseWorkflow'. Params: pause (1–600 seconds), optional userId.
+   */
+  async pauseWorkflow(
+    params: Record<string, unknown>,
+    _context?: { workflowInput?: Record<string, unknown> },
+  ): Promise<{ status: string; pause_applied: number }> {
+    const pauseRaw = params?.pause ?? _context?.workflowInput?.pause;
+    if (pauseRaw === undefined || pauseRaw === null || String(pauseRaw).trim() === '') {
+      throw new BadRequestException('pause is required for pauseWorkflow (1–600 seconds).');
+    }
+    if (!/^\d+$/.test(String(pauseRaw).trim())) {
+      throw new BadRequestException(
+        'Pause value must be a positive number without alphabets or special characters.',
+      );
+    }
+    let pauseSeconds = Number(pauseRaw);
+    if (pauseSeconds <= 0 || pauseSeconds > 600) {
+      throw new BadRequestException('Pause value must be between 1 and 600 seconds.');
+    }
+    const pauseMs = pauseSeconds * 1000;
+    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    return { status: 'completed', pause_applied: pauseSeconds };
   }
 }

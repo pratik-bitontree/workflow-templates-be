@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { BullModule } from '@nestjs/bullmq';
+import { Node, NodeSchema } from '../schemas/node.schema';
 import { NodeExecution, NodeExecutionSchema } from '../schemas/node-execution.schema';
 import { UserSecrets, UserSecretsSchema } from '../schemas/user-secrets.schema';
 import { WorkflowQueueProcessor } from './workflow-queue.processor';
@@ -14,6 +15,9 @@ import { GsheetsService } from './services/gsheets.service';
 import { CalService } from './services/cal.service';
 import { ZohoService } from './services/zoho.service';
 import { HubspotService } from './services/hubspot/hubspot.service';
+import { TwitterService } from './services/twitter.service';
+import { WordPressService } from './services/wordpress.service';
+import { LinkedInService } from './services/linkedin.service';
 import { ApiKeyManager } from './rate-limitting/api-key-manager.service';
 import { RateLimiter } from './rate-limitting/rate-limiter.service';
 import { CandidateProfileExecutor } from './agent-executor/candidate-profile.executor';
@@ -25,6 +29,7 @@ import { CarouselPdfExecutor } from './agent-executor/carousel-pdf.executor';
 @Module({
   imports: [
     MongooseModule.forFeature([
+      { name: Node.name, schema: NodeSchema },
       { name: NodeExecution.name, schema: NodeExecutionSchema },
       { name: UserSecrets.name, schema: UserSecretsSchema },
     ]),
@@ -47,6 +52,9 @@ import { CarouselPdfExecutor } from './agent-executor/carousel-pdf.executor';
     CalService,
     ZohoService,
     HubspotService,
+    TwitterService,
+    WordPressService,
+    LinkedInService,
     CandidateProfileExecutor,
     RedditSearchExecutor,
     SeoKeywordsExecutor,

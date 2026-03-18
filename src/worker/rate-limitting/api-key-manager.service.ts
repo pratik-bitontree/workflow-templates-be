@@ -165,6 +165,22 @@ export class ApiKeyManager {
       if (keys.length > 0) return keys;
     }
 
+    if (provider === 'groq') {
+      const keys: string[] = [];
+      let i = 1;
+      while (true) {
+        const key = this.configService.get<string>(`GROQ_API_KEY_${i}`);
+        if (!key || !String(key).trim()) break;
+        keys.push(String(key).trim());
+        i++;
+      }
+      if (keys.length === 0) {
+        const singleKey = this.configService.get<string>('GROQ_API_KEY');
+        if (singleKey && String(singleKey).trim()) return [singleKey.trim()];
+      }
+      if (keys.length > 0) return keys;
+    }
+
     const keys: string[] = [];
     let i = 1;
     while (true) {

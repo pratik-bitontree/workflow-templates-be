@@ -129,6 +129,17 @@ export class RunWorkflowService {
     return { executionId: workflowExecutionId };
   }
 
+  /** Normalize nodeMasterId to a string so the worker always receives a string (survives Redis/Bull serialization). */
+  private normalizeNodeMasterId(nodeMasterId: any): string | undefined {
+    if (nodeMasterId == null) return undefined;
+    if (typeof nodeMasterId === 'string' && nodeMasterId.trim()) return nodeMasterId.trim();
+    const o = nodeMasterId as any;
+    if (o?.$oid) return String(o.$oid);
+    if (o?._id != null) return typeof o._id === 'string' ? o._id : o._id?.toString?.();
+    if (typeof o?.toString === 'function') return o.toString();
+    return undefined;
+  }
+
   async enqueueNode(
     workflowId: string,
     workflowExecutionId: string,
@@ -147,6 +158,8 @@ export class RunWorkflowService {
     if ((node as any).nextNodeId != null) {
       parameters.nextNodeId = (node as any).nextNodeId?.toString?.() ?? String((node as any).nextNodeId);
     }
+    const nodeMasterIdStr = this.normalizeNodeMasterId(node.nodeMasterId);
+    if (nodeMasterIdStr) parameters.nodeMasterId = nodeMasterIdStr;
     const payload: Record<string, unknown> = {
       type: node.type || 'action',
       workflowId,
@@ -157,7 +170,7 @@ export class RunWorkflowService {
       userId,
       functionToExecute,
       workflowInput: variables && Object.keys(variables).length > 0 ? variables : [],
-      nodeMasterId: node.nodeMasterId?._id?.toString?.() || node.nodeMasterId,
+      nodeMasterId: nodeMasterIdStr ?? undefined,
       subNodes: node.subNodes || [],
       dynamicParams: node.dynamicParams || [],
     };
@@ -466,7 +479,11 @@ export class RunWorkflowService {
             const merged: unknown[] = [];
             for (let bi = 0; bi < batches.length; bi++) {
               const batch = (batches[bi] ?? []) as Record<string, unknown>[];
-              const iterResult = (results[bi] ?? {}) as Record<string, unknown>;
+              const returnvalue = (results[bi] ?? {}) as Record<string, unknown>;
+              // Use the value under variableName so loop.variableName.result.atsResult resolves (e.g. loop.candidate_profile_analyzer.result.atsResult)
+              const iterResult = (variableName && returnvalue[variableName] !== undefined)
+                ? returnvalue[variableName]
+                : returnvalue;
               for (const row of batch) {
                 merged.push({ ...(row as object), [variableName]: iterResult });
               }

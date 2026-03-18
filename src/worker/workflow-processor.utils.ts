@@ -12,7 +12,7 @@
  */
 
 /** Job types that require polling for completion (e.g. agents, heygen, slidespeak). */
-const POLLING_JOB_TYPES = new Set(['heygen', 'slidespeak', 'agents']);
+const POLLING_JOB_TYPES = new Set(['heygen', 'slidespeak']);
 
 /**
  * Whether this job type requires polling / webhook wait.
@@ -37,12 +37,12 @@ export function requiresPolling(
   nodeMasterId: string,
 ): boolean {
   if (!jobType) return false;
-  if (jobType.toLowerCase() === 'agents') {
-    const completeImmediately =
-      process.env.AGENTS_COMPLETE_IMMEDIATELY === 'true' ||
-      process.env.AGENTS_COMPLETE_IMMEDIATELY === '1';
-    if (completeImmediately) return false;
-  }
+  // if (jobType.toLowerCase() === 'agents') {
+  //   const completeImmediately =
+  //     process.env.AGENTS_COMPLETE_IMMEDIATELY === 'true' ||
+  //     process.env.AGENTS_COMPLETE_IMMEDIATELY === '1';
+  //   if (completeImmediately) return false;
+  // }
   return (
     POLLING_JOB_TYPES.has(jobType.toLowerCase()) &&
     nodeMasterId !== '68a5cd849a76ecbfbbcd2999'
@@ -118,6 +118,26 @@ export function resolvePlaceholderInString(
             v = (v as Record<string, unknown>)[key];
           } else {
             v = undefined;
+          }
+        }
+        // Row has no agent result: use top-level candidate_profile_analyzer or result
+        if ((v === undefined || v === null) && restKeys[0] === 'candidate_profile_analyzer') {
+          const top = variables.candidate_profile_analyzer;
+          if (top != null && typeof top === 'object' && !Array.isArray(top)) {
+            v = restKeys.slice(1).reduce((acc: unknown, k) => (acc != null && typeof acc === 'object' ? (acc as Record<string, unknown>)[k] : undefined), top);
+          }
+        }
+        if ((v === undefined || v === null) && (restKeys[0] === 'candidate_profile_analyzer' || restKeys[0] === 'result')) {
+          let topResult = variables.result;
+          if ((topResult == null || typeof topResult !== 'object') && variables.candidate_profile_analyzer != null && typeof variables.candidate_profile_analyzer === 'object') {
+            topResult = (variables.candidate_profile_analyzer as Record<string, unknown>).result;
+          }
+          if (topResult != null && typeof topResult === 'object' && !Array.isArray(topResult)) {
+            const fromResult = restKeys.slice(2).reduce(
+              (acc: unknown, k) => (acc != null && typeof acc === 'object' ? (acc as Record<string, unknown>)[k] : undefined),
+              topResult,
+            );
+            if (fromResult !== undefined) v = fromResult;
           }
         }
         if (v === undefined || v === null) return '';

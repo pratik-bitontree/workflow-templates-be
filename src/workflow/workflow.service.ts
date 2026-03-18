@@ -18,6 +18,18 @@ function isWebhookTriggerType(type: string | undefined): boolean {
   return type != null && WEBHOOK_TRIGGER_TYPES.has((type || '').toLowerCase());
 }
 
+/**
+ * Unwrap node result when it's a single-key map (e.g. { variableName: output }).
+ * So the API returns the actual agent/output content for display instead of the wrapper.
+ */
+function unwrapNodeResult(result: unknown): unknown {
+  if (result == null) return result;
+  if (typeof result !== 'object' || Array.isArray(result)) return result;
+  const keys = Object.keys(result as object);
+  if (keys.length !== 1) return result;
+  return (result as Record<string, unknown>)[keys[0]];
+}
+
 @Injectable()
 export class WorkflowService {
   constructor(
@@ -220,7 +232,7 @@ export class WorkflowService {
       nodeName: ne.nodeId?.name,
       type: ne.nodeId?.type,
       status: ne.status,
-      result: ne.result,
+      result: unwrapNodeResult(ne.result),
       startTime: ne.startTimeStamp,
       endTime: ne.endTimeStamp,
     }));

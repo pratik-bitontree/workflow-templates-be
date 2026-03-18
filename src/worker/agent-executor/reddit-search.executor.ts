@@ -1,12 +1,13 @@
 /**
  * In-process Reddit Search agent (Reddit Topic Trend Summary).
- * Uses Serper to search Reddit, then OpenAI to structure into template result shape.
- * Requires SERPER_API_KEY in .env.
+ * Uses Serper to search Reddit, then Groq (OpenAI-compatible) to structure into template result shape.
+ * Requires SERPER_API_KEY and GROQ_API_KEY in .env.
+ * (OpenAI path commented out for now; using Groq for testing.)
  */
 
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import OpenAI from 'openai';
+import OpenAI from 'openai'; // Groq is OpenAI-compatible; same client with baseURL
 import axios from 'axios';
 
 const REDDIT_SEARCH_SYSTEM = `You are a summarizer. Given raw search results about a topic from Reddit, output a single JSON object with exactly these keys (all strings or arrays of strings):

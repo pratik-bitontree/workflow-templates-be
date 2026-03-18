@@ -14,10 +14,13 @@ export const AGENT_NODE_MASTER_IDS = new Set([
 ]);
 
 export function getAgentIdFromContext(nodeMasterId: unknown): string | null {
-  if (!nodeMasterId) return null;
+  if (nodeMasterId == null) return null;
+  const anyId = nodeMasterId as any;
   const id =
-    (nodeMasterId as any)?.metaData?.agentId ??
-    (nodeMasterId as any)?._id?.toString?.() ??
-    (typeof nodeMasterId === 'string' ? nodeMasterId : null);
-  return id ? String(id) : null;
+    anyId?.metaData?.agentId ??
+    anyId?.$oid ??
+    anyId?._id?.toString?.() ??
+    (typeof nodeMasterId === 'string' ? nodeMasterId : null) ??
+    (typeof anyId?.toString === 'function' ? anyId.toString() : null);
+  return id ? String(id).trim() : null;
 }
